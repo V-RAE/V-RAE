@@ -1,6 +1,6 @@
 include:
   - vjepa2_1_lerobot.yaml
-run_name: vjepa2_1_libero_reconstruction_single_gpu_bs4
+run_name: vjepa2_1_libero_reconstruction_single_gpu_bs4_50k
 training:
   init_from: null
   init_weights: model
@@ -14,3 +14,4 @@ training:
   checkpoint_interval: 1000
 wandb:
   mode: online
+  sample_interval: 2000
