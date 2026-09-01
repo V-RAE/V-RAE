@@ -8,7 +8,7 @@
 2. Libero 数据加载在重构后从“每个 episode 随机采样完整 clip”变成“每个原始帧都作为起点”，episode 尾部越界帧被重复为最后一帧。
 3. decoder 以 4 帧 tubelet 为单位生成视频，现有样本中每个第 4 帧边界的运动误差明显更高，表现为块状跳动。
 
-本次只做了代码、配置、元数据和已保存样本的只读分析，没有修改训练代码。`Upload data manifest` 对应历史提交 `a7783e8`，不是独立分支。
+`Upload data manifest` 对应历史提交 `a7783e8`，不是独立分支。本轮已按该逻辑补齐 Libero 重建数据集和训练入口；下文保留问题定位，并补充实施结果。
 
 ## 1. `temporal_difference` 为什么恒为 0
 
@@ -203,7 +203,7 @@ tubelet 边界: 约 0.010 ~ 0.014
 
 ## 4. `Upload data manifest` 中 K600/UCF101 与 Libero 的差异
 
-| 项目 | Kinetics-600 / UCF101 | 当前 Libero |
+| 项目 | Kinetics-600 / UCF101 | 修复前 Libero |
 |---|---|---|
 | 数据组织 | manifest 中每行一个视频 | LeRobot parquet + episode |
 | 每个 dataset item | 一个视频随机采样一个 clip | 一个原始帧作为一个 item |
@@ -238,9 +238,19 @@ gan:
 当前 Libero 实际 run 的配置：
 
 - [`ckpts/recon_training/vjepa2_1_libero_reconstruction_single_gpu_bs4_50k_detached/resolved_config.yaml`](/zsh/code/V-RAE/ckpts/recon_training/vjepa2_1_libero_reconstruction_single_gpu_bs4_50k_detached/resolved_config.yaml)
-- [`ckpts/recon_training/vjepa2_1_libero_reconstruction_frame_interval4/resolved_config.yaml`](/zsh/code/V-RAE/ckpts/recon_training/vjepa2_1_libero_reconstruction_frame_interval4/resolved_config.yaml)
+- 当前运行目录：`ckpts/recon_training/vjepa2_1_libero_reconstruction_current/`
 
-## 5. 影响因素优先级
+## 5. 本轮实施内容
+
+- 新增 [`src/vrae/data/reconstruction.py`](/zsh/code/V-RAE/src/vrae/data/reconstruction.py) 中的 `ReconstructionDataset`。它继承 `LeRobotDataset`，复用 LeRobot v3 的 metadata、parquet 和视频解码能力；manifest 只负责 episode、视角、长度和可选 task 映射。
+- 重建 manifest 使用 CSV。脚本 [`src/vrae/data/create_reconstruction_manifest.py`](/zsh/code/V-RAE/src/vrae/data/create_reconstruction_manifest.py) 可从任意本地 LeRobot v3 根目录生成 manifest；支持 `view`/`camera_key`、`frame_count`/`length` 等字段别名，缺失长度时使用 episode metadata。
+- 每个 episode 每次只随机选择一个视角和一个 clip。固定模式默认 `interval=3`，完整窗口不足时过滤 episode，不做 padding；随机模式可在 `1..4` 中采样，越界时向更小 interval 回退。`set_epoch(epoch)` 会改变 temporal clip 和空间增强的随机序列。
+- 输出固定为单视角 `[B,T,C,H,W]`，空间处理为 resize short side、random crop、random flip。生成训练仍使用 [`src/vrae/data/lerobot.py`](/zsh/code/V-RAE/src/vrae/data/lerobot.py)，没有复用重建采样器。
+- `configs/training/vjepa2_1_lerobot.yaml` 已切换到 `lerobot_reconstruction` manifest 数据集，保留 `L1 + LPIPS + Gram`，`temporal_difference=0`，并在 epoch 30 启用 VideoMAE GAN。GAN 的 discriminator、optimizer、scheduler 和 loss state 一并写入 checkpoint，支持 resume。
+
+本地验证结果：重建 build-only、生成 build-only、`test/test_lerobot_dataset.py`（2 个测试）和一个真实 Libero manifest 采样 smoke test 均通过。生成的 `data/` 内容保持在 `.gitignore` 中，不提交数据文件。
+
+## 6. 影响因素优先级（修复前诊断）
 
 ### 高优先级：时序 loss 被关闭
 
@@ -283,26 +293,26 @@ training:
 
 这会显著增加梯度噪声。它不解释 `temporal_difference=0`，但可能让 decoder 更容易学习平均化、静态化的重建结果。
 
-### 中优先级：Libero 没有原始 VideoMAE GAN
+### 中优先级：Libero 没有原始 VideoMAE GAN（修复前）
 
-原始 K600/UCF101 重建在 epoch 30 后启用 VideoMAE 对抗损失；当前 Libero 代码完全没有 GAN 分支。它主要影响视频感知质量、纹理和动态真实性，不应被当作 temporal loss 的替代品。
+原始 K600/UCF101 重建在 epoch 30 后启用 VideoMAE 对抗损失；修复前 Libero 代码没有 GAN 分支。本轮已恢复该分支。它主要影响视频感知质量、纹理和动态真实性，不应被当作 temporal loss 的替代品。
 
-### 低优先级：空间增强差异
+### 低优先级：空间增强差异（修复前）
 
-Libero 使用固定的 resize + center crop，没有 random crop 和 random flip。这会减少空间增强，但通常不是“卡顿”的主因。
+Libero 修复前使用固定的 resize + center crop，没有 random crop 和 random flip；本轮已切换为 resize + random crop + random flip。这会减少空间增强，但通常不是“卡顿”的主因。
 
-## 6. 建议的最小修复顺序
+## 7. 建议的最小修复顺序（已落实项）
 
-1. 把 `temporal_difference` 改成非零，并单独记录 raw temporal loss。
-2. 修复 Libero clip 索引，只保留满足以下条件的完整窗口：
+1. `temporal_difference` 保持 0（按你的要求），因此它仍会在日志中恒为 0；如要用时序连续性约束，需要另行设为非零。
+2. 已修复 Libero clip 索引，只保留满足以下条件的完整窗口：
 
    ```text
    episode_length >= 1 + (num_frames - 1) * frame_interval
    ```
 
    禁止用 episode 最后一帧进行 clamp padding。
-3. 先使用 `frame_interval=1` 训练。Libero 是 10 FPS，`interval=4` 表示相邻输入帧间隔 0.4 秒、整个 clip 跨 6 秒以上，和原始配置并不等价。
-4. 恢复“每个 episode 一个随机完整 clip”的采样策略，避免每个原始帧都成为训练样本。
+3. 当前默认使用 `frame_interval=3`；固定模式下越界 episode 直接失效。需要更密时间变化时可设置 `random_frame_interval=true`，在 1..4 采样并向下回退。
+4. 已恢复“每个 episode 一个随机完整 clip”的采样策略，避免每个原始帧都成为训练样本。
 5. 添加 tubelet 边界诊断指标：
 
    ```text
@@ -312,16 +322,16 @@ Libero 使用固定的 resize + center crop，没有 random crop 和 random flip
    ```
 
    当前保存样本该比例约为 `1.57`，修复后应明显下降。
-6. 最后再评估是否需要恢复 VideoMAE GAN，以及是否调整小 batch 下的学习率。
+6. VideoMAE GAN 已设为 epoch 30 启用；仍需在真实训练中观察小 batch 下是否需要调整学习率。
 
-## 7. 已排除的因素
+## 8. 已排除的因素
 
-当前没有发现多视角展平顺序错误：
+修复前的生成训练没有发现多视角展平顺序错误：
 
 ```text
 [B,T,V,C,H,W] -> [B,V,T,C,H,W] -> [B*V,T,C,H,W]
 ```
 
-对应实现见 [`src/vrae/training/recon_training/data.py:15`](/zsh/code/V-RAE/src/vrae/training/recon_training/data.py:15)。它没有把相邻时间步和两个相机交错，temporal loss 也沿真实的 `T` 维计算。
+对应旧实现见历史提交；当前重建路径已直接输出单视角 `[B,T,C,H,W]`，生成路径仍由 [`src/vrae/data/lerobot.py`](/zsh/code/V-RAE/src/vrae/data/lerobot.py) 保持原有多视角契约。
 
 另外，视频保存函数会把输出裁剪到 `[0,1]` 后再编码，见 [`src/vrae/training/common/visualization.py:10`](/zsh/code/V-RAE/src/vrae/training/common/visualization.py:10)。因此 decoder 输出范围略超出 `[0,1]` 会造成高光/暗部裁切，但不是当前卡顿的主要来源。

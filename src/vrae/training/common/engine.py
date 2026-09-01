@@ -251,14 +251,38 @@ class ClassConditionalVideoDataset:
 
     @staticmethod
     def build(config: Mapping[str, Any], paths: ProjectPaths, dataset_name: str):
-        if dataset_name != "lerobot":
-            raise ValueError("class-conditional training only supports dataset_name='lerobot'")
-
-        from vrae.data.lerobot import LeRobotVideoDataset
-
         data = config["data"]
         root_value = data.get("root")
         root = Path(str(root_value)).expanduser() if root_value else paths.dataset("lerobot")
+        if dataset_name == "reconstruction":
+            from vrae.data.reconstruction import ReconstructionDataset
+
+            manifest = data.get("manifest")
+            if not manifest:
+                raise ValueError("Reconstruction generation requires data.manifest")
+            manifest_path = Path(str(manifest))
+            if not manifest_path.is_absolute():
+                manifest_path = paths.project_root / manifest_path
+            return ReconstructionDataset(
+                root,
+                manifest_path,
+                repo_id=str(data.get("repo_id", "libero")),
+                num_frames=int(data["num_frames"]),
+                frame_interval=int(data.get("frame_interval", 3)),
+                random_frame_interval=bool(data.get("random_frame_interval", False)),
+                frame_interval_min=int(data.get("frame_interval_min", 1)),
+                frame_interval_max=int(data.get("frame_interval_max", 4)),
+                image_size=int(data.get("image_size", 256)),
+                random_flip=bool(data.get("random_flip", True)),
+                seed=int(data.get("seed", 3407)),
+            )
+        if dataset_name != "lerobot":
+            raise ValueError(
+                "class-conditional training only supports dataset_name='lerobot' or 'reconstruction'"
+            )
+
+        from vrae.data.lerobot import LeRobotVideoDataset
+
         return LeRobotVideoDataset(
             root,
             repo_id=str(data.get("repo_id", "libero")),
@@ -400,7 +424,11 @@ def compute_class_conditional_latent_stats(
     # checkpoint state for the lifetime of the training process.
     del stage1_checkpoint_payload
     dataset = ClassConditionalVideoDataset.build(config, paths, dataset_name)
-    clip_indices = episode_start_indices(dataset)
+    if dataset_name == "reconstruction":
+        # ReconstructionDataset indexes one sampled clip per valid episode.
+        clip_indices = list(range(len(dataset)))
+    else:
+        clip_indices = episode_start_indices(dataset)
     local_indices = clip_indices[context.rank :: context.world_size]
     global_batch = int(config["training"]["global_batch_size"])
     if global_batch <= 0:
@@ -805,6 +833,9 @@ def train_class_conditional(
     throughput_window_started_at = time.perf_counter()
     throughput_window_updates = 0
     for epoch in range(start_epoch, epochs):
+        set_epoch = getattr(loader.dataset, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
         batch_requested_at = time.perf_counter()
         for batch in loader:
             batch_received_at = time.perf_counter()

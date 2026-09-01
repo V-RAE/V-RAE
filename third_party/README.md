@@ -24,3 +24,32 @@ curl -fL \
   https://github.com/toshas/torch-fidelity/releases/download/v0.2.0/weights-vgg16-lpips.pth \
   -o ckpts/pretrained/perceptual/lpips_vgg.pt
 ```
+
+## VideoMAE discriminator weights
+
+The reconstruction GAN uses the legacy InternVideo VideoMAE-B checkpoint
+`vit_b_hybrid_pt_800e.pth`. The original Hugging Face repository is gated and
+requires accepting its access conditions first. The same file is also listed
+in the official OpenGVLab ModelScope mirror, which can be downloaded directly:
+
+```bash
+mkdir -p ckpts/pretrained/discriminators/videomae
+curl -fL \
+  https://modelscope.cn/models/OpenGVLab/InternVideo1.0/resolve/master/\
+internvideomae_classification/vit_b_hybrid_pt_800e.pth \
+  -o ckpts/pretrained/discriminators/videomae/vit_b_hybrid_pt_800e.pth
+```
+
+Alternatively, after `hf auth login` and accepting the gated model terms:
+
+```bash
+hf download OpenGVLab/InternVideo1.0 \
+  internvideomae_classification/vit_b_hybrid_pt_800e.pth \
+  --local-dir ckpts/pretrained/discriminators/videomae
+mv ckpts/pretrained/discriminators/videomae/\
+internvideomae_classification/vit_b_hybrid_pt_800e.pth \
+ckpts/pretrained/discriminators/videomae/vit_b_hybrid_pt_800e.pth
+```
+
+The final path must match `gan.discriminator_checkpoint` in the reconstruction
+configuration.

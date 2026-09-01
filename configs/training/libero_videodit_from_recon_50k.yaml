@@ -1,9 +1,0 @@
-include:
-  - libero_videodit.yaml
-
-run_name: vjepa2_1_libero_videodit_from_recon_50k
-stage1:
-  checkpoint: ckpts/recon_training/vjepa2_1_libero_reconstruction_single_gpu_bs4_50k_detached/checkpoints/latest.pt
-  weights: ema
-latent_normalizer:
-  path: ckpts/libero_videogen/latent_stats/vjepa2_1_libero_recon_50k_multiview.pt

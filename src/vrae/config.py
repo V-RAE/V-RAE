@@ -142,6 +142,13 @@ def validate_config(config: Mapping[str, Any]) -> None:
                 raise ConfigError("model.multiview.num_views must equal len(data.camera_keys)")
             if any(not isinstance(camera, Mapping) or "key" not in camera for camera in cameras):
                 raise ConfigError("each data.camera_keys entry must be a mapping with key")
+        if str(data.get("dataset", "")) == "lerobot_reconstruction":
+            if not data.get("manifest"):
+                raise ConfigError("data.manifest is required for lerobot_reconstruction")
+            interval_min = int(data.get("frame_interval_min", 1))
+            interval_max = int(data.get("frame_interval_max", 4))
+            if interval_min <= 0 or interval_max < interval_min:
+                raise ConfigError("data.frame_interval_min/max are invalid")
     training = config.get("training", {})
     if isinstance(training, Mapping) and training.get("resume") and training.get("init_from"):
         raise ConfigError("training.resume and training.init_from are mutually exclusive")

@@ -10,9 +10,6 @@ and an MLP, but no cross-attention.
 
 from __future__ import annotations
 
-import logging
-import os
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
@@ -21,6 +18,7 @@ from torch.utils.checkpoint import checkpoint
 
 from vrae.models.dit.blocks import (
     AdaLNZeroDDTBlock,
+    GaussianFourierTimeEmbedding,
     RMSNorm,
     modulate,
 )
@@ -28,26 +26,6 @@ from vrae.models.rope3d import (
     build_3d_positions,
     build_video_dit_3d_rope_cache_from_positions,
 )
-
-LOGGER = logging.getLogger(__name__)
-
-
-def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
-    """Build the cosine/sine timestep features used by Wan22."""
-
-    if int(dim) <= 0 or int(dim) % 2:
-        raise ValueError(f"embedding dimension must be a positive even number, got {dim}")
-    if position.ndim == 0:
-        position = position[None]
-    if position.ndim != 1:
-        raise ValueError(f"position must be scalar or [B], got {tuple(position.shape)}")
-    half = int(dim) // 2
-    frequency = torch.pow(
-        torch.tensor(10_000.0, device=position.device, dtype=torch.float64),
-        -torch.arange(half, device=position.device, dtype=torch.float64) / half,
-    )
-    angle = torch.outer(position.to(torch.float64), frequency)
-    return torch.cat((angle.cos(), angle.sin()), dim=-1).to(dtype=position.dtype)
 
 
 class ActionHead(nn.Module):
@@ -73,55 +51,8 @@ class ActionHead(nn.Module):
         return self.proj(modulate(self.norm(x), shift[:, None], scale[:, None]))
 
 
-class ActionDiTBlock(AdaLNZeroDDTBlock):
-    """Existing conditioned DDT block with action-friendly metadata."""
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        attn_head_dim: int,
-        num_heads: int,
-        ffn_dim: int,
-        eps: float,
-        *,
-        rope_theta: float = 10_000.0,
-        attention_dropout: float = 0.0,
-        attention_backend: str = "auto",
-    ) -> None:
-        if int(hidden_dim) != int(attn_head_dim) * int(num_heads):
-            raise ValueError(
-                "ActionDiT requires hidden_dim == num_heads * attn_head_dim for the "
-                f"shared attention path, got {hidden_dim}, {num_heads}, {attn_head_dim}"
-            )
-        super().__init__(
-            hidden_size=int(hidden_dim),
-            num_heads=int(num_heads),
-            # AdaLNZeroDDTBlock derives its SwiGLU width as
-            # ``2/3 * hidden_size * mlp_ratio``; choose the ratio so the
-            # existing block realizes the requested ``ffn_dim``.
-            mlp_ratio=1.5 * float(ffn_dim) / float(hidden_dim),
-            rope_theta=float(rope_theta),
-            attention_dropout=float(attention_dropout),
-            attention_backend=attention_backend,
-        )
-        self.attn_head_dim = int(attn_head_dim)
-        self.ffn_dim = int(ffn_dim)
-
-
 class ActionDiT(nn.Module):
     """Timestep-conditioned diffusion Transformer over action token sequences."""
-
-    ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.")
-    ACTION_BACKBONE_META_KEYS = (
-        "hidden_dim",
-        "ffn_dim",
-        "num_layers",
-        "num_heads",
-        "attn_head_dim",
-        "text_dim",
-        "freq_dim",
-        "eps",
-    )
 
     def __init__(
         self,
@@ -152,8 +83,6 @@ class ActionDiT(nn.Module):
         ):
             if int(value) <= 0:
                 raise ValueError(f"`{name}` must be positive, got {value}")
-        if int(freq_dim) % 2:
-            raise ValueError(f"`freq_dim` must be even, got {freq_dim}")
         if int(attn_head_dim) % 2:
             raise ValueError(f"`attn_head_dim` must be even for RoPE, got {attn_head_dim}")
         if int(hidden_dim) != int(num_heads) * int(attn_head_dim):
@@ -172,19 +101,16 @@ class ActionDiT(nn.Module):
         self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
 
         self.action_encoder = nn.Linear(self.action_dim, self.hidden_dim)
-        self.time_embedding = nn.Sequential(
-            nn.Linear(self.freq_dim, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
+        self.time_embedder = GaussianFourierTimeEmbedding(
+            self.hidden_dim,
+            embedding_size=self.freq_dim,
         )
         self.blocks = nn.ModuleList(
             [
-                ActionDiTBlock(
-                    self.hidden_dim,
-                    self.attn_head_dim,
-                    self.num_heads,
-                    self.ffn_dim,
-                    self.eps,
+                AdaLNZeroDDTBlock(
+                    hidden_size=self.hidden_dim,
+                    num_heads=self.num_heads,
+                    mlp_ratio=1.5 * self.ffn_dim / self.hidden_dim,
                     rope_theta=self.rope_theta,
                     attention_dropout=attention_dropout,
                     attention_backend=attention_backend,
@@ -193,6 +119,8 @@ class ActionDiT(nn.Module):
             ]
         )
         self.head = ActionHead(self.hidden_dim, self.action_dim, self.eps)
+        nn.init.normal_(self.time_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.time_embedder.mlp[2].weight, std=0.02)
 
         # The action sequence is a 1-D video grid.  Buffers are non-persistent so
         # checkpoints keep only learned weights, matching VRAEVideoDiT caches.
@@ -207,9 +135,6 @@ class ActionDiT(nn.Module):
         self.register_buffer("_rope_sine", sine, persistent=False)
         self.register_buffer("_positions", positions, persistent=False)
 
-    def _apply(self, fn: Any) -> "ActionDiT":
-        return super()._apply(fn)
-
     def get_freqs(self, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
         if int(seq_len) <= 0 or int(seq_len) > self._rope_cosine.shape[0]:
             raise ValueError(f"action sequence length must be in [1, {self._rope_cosine.shape[0]}]")
@@ -221,77 +146,6 @@ class ActionDiT(nn.Module):
 
     def _positions_for(self, seq_len: int, device: torch.device) -> torch.Tensor:
         return self._positions[:seq_len].to(device=device)
-
-    @classmethod
-    def backbone_key_set(cls, keys) -> set[str]:
-        return {
-            str(key)
-            for key in keys
-            if not any(str(key).startswith(prefix) for prefix in cls.ACTION_BACKBONE_SKIP_PREFIXES)
-        }
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        action_dit_config: dict[str, Any],
-        action_dit_pretrained_path: str | None = None,
-        skip_dit_load_from_pretrain: bool = False,
-        device: str = "cuda",
-        torch_dtype: torch.dtype = torch.bfloat16,
-    ) -> "ActionDiT":
-        if action_dit_config is None:
-            raise ValueError("`action_dit_config` is required")
-        expert = cls(**dict(action_dit_config)).to(device=device, dtype=torch_dtype)
-        if skip_dit_load_from_pretrain or not action_dit_pretrained_path:
-            return expert
-        path = Path(action_dit_pretrained_path)
-        if not path.is_absolute():
-            path = Path(__file__).resolve().parents[4] / path
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"ActionDiT checkpoint does not exist: {path}")
-        payload = torch.load(path, map_location="cpu", weights_only=False)
-        if not isinstance(payload, dict):
-            raise ValueError(f"ActionDiT checkpoint must be a mapping, got {type(payload)}")
-        meta = payload.get("meta")
-        if not isinstance(meta, dict):
-            raise ValueError("ActionDiT checkpoint is missing mapping `meta`")
-        expected = {
-            "hidden_dim": int(action_dit_config["hidden_dim"]),
-            "ffn_dim": int(action_dit_config["ffn_dim"]),
-            "num_layers": int(action_dit_config["num_layers"]),
-            "num_heads": int(action_dit_config["num_heads"]),
-            "attn_head_dim": int(action_dit_config["attn_head_dim"]),
-            "text_dim": int(action_dit_config["text_dim"]),
-            "freq_dim": int(action_dit_config["freq_dim"]),
-            "eps": float(action_dit_config["eps"]),
-        }
-        for key in cls.ACTION_BACKBONE_META_KEYS:
-            if key not in meta:
-                raise ValueError(f"ActionDiT checkpoint is missing meta.{key}")
-            if key == "eps":
-                valid = abs(float(meta[key]) - expected[key]) <= 1e-12
-            else:
-                valid = int(meta[key]) == expected[key]
-            if not valid:
-                raise ValueError(f"ActionDiT meta.{key} mismatch: expected {expected[key]}, got {meta[key]}")
-        backbone = payload.get("backbone_state_dict")
-        if not isinstance(backbone, dict):
-            raise ValueError("ActionDiT checkpoint is missing mapping `backbone_state_dict`")
-        expected_keys = cls.backbone_key_set(expert.state_dict().keys())
-        provided_keys = set(backbone)
-        missing = sorted(expected_keys - provided_keys)
-        unexpected = sorted(provided_keys - expected_keys)
-        if missing or unexpected:
-            raise ValueError(f"ActionDiT backbone key mismatch: missing={missing[:10]}, unexpected={unexpected[:10]}")
-        merged = expert.state_dict()
-        for key in expected_keys:
-            value = backbone[key]
-            if not torch.is_tensor(value) or tuple(value.shape) != tuple(merged[key].shape):
-                raise ValueError(f"ActionDiT checkpoint tensor mismatch for {key}")
-            merged[key] = value.to(device=merged[key].device, dtype=merged[key].dtype)
-        expert.load_state_dict(merged, strict=True)
-        LOGGER.info("Loaded ActionDiT backbone from %s", path)
-        return expert
 
     def _prepare(
         self,
@@ -319,16 +173,13 @@ class ActionDiT(nn.Module):
             )
         elif context_mask.ndim != 2 or tuple(context_mask.shape) != tuple(context.shape[:2]):
             raise ValueError(f"context_mask must match context [B,L], got {tuple(context_mask.shape)}")
-        timestep_features = sinusoidal_embedding_1d(self.freq_dim, timestep)
-        time_embedding = self.time_embedding(timestep_features)
+        time_embedding = self.time_embedder(timestep.to(action_tokens.device))
         return {
             "tokens": self.action_encoder(action_tokens),
             "freqs": self.get_freqs(seq_len),
             "positions": self._positions_for(seq_len, action_tokens.device),
             "t": time_embedding,
-            # MoT consumes the condition and lets each AdaLN block create its
-            # own six-way modulation, exactly like VRAEVideoDiT.
-            "t_mod": time_embedding[:, None],
+            "t_mod": time_embedding,
             "context": context,
             "context_mask": context_mask[:, None, :].expand(-1, seq_len, -1),
             "meta": {"batch_size": batch_size, "seq_len": seq_len},
@@ -396,7 +247,4 @@ class ActionDiT(nn.Module):
                 )
         return self.post_dit(value, state)
 
-
-DiTBlock = ActionDiTBlock
-
-__all__ = ["ActionDiT", "ActionDiTBlock", "ActionHead", "DiTBlock", "sinusoidal_embedding_1d"]
+__all__ = ["ActionDiT", "ActionHead"]

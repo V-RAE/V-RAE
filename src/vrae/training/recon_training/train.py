@@ -41,11 +41,8 @@ from vrae.training.common.optim import build_optimizer, build_scheduler
 from vrae.training.common.precision import PrecisionPolicy
 from vrae.training.common.visualization import comparison_video
 from vrae.training.common.wandb import WandbLogger
-from vrae.training.recon_training.data import (
-    CudaVideoPrefetchIterator,
-    build_reconstruction_loader,
-    flatten_multiview_video,
-)
+from vrae.training.recon_training.data import CudaVideoPrefetchIterator, build_reconstruction_loader
+from vrae.training.recon_training.gan import GANController, VideoMAEDiscriminator
 from vrae.training.recon_training.losses import ReconstructionLoss
 from vrae.training.recon_training.noise import add_reconstruction_noise
 from vrae.training.recon_training.sample import save_reconstruction_sample
@@ -81,8 +78,8 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("V-JEPA 2.1 entry requires task=recon_training")
     if str(config["model"]["encoder"]["name"]) != "vjepa2_1":
         raise ValueError("This training entry only supports the V-JEPA 2.1 encoder")
-    if str(config["data"].get("dataset")) != "lerobot":
-        raise ValueError("V-JEPA 2.1 reconstruction requires data.dataset=lerobot")
+    if str(config["data"].get("dataset")) != "lerobot_reconstruction":
+        raise ValueError("V-JEPA 2.1 reconstruction requires data.dataset=lerobot_reconstruction")
     if str(training["scheduler"]["name"]) != "constant":
         raise ValueError("The formal reconstruction scheduler must be constant")
     if float(training["optimizer"]["lr"]) <= 0:
@@ -95,12 +92,26 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("training.init_weights must be model or ema")
     if init_weights == "ema" and not training.get("init_from") and not training.get("resume"):
         raise ValueError("training.init_weights=ema requires init_from or resume")
+    data = config["data"]
+    if not data.get("manifest"):
+        raise ValueError("Libero reconstruction requires data.manifest")
+    interval_min = int(data.get("frame_interval_min", 1))
+    interval_max = int(data.get("frame_interval_max", 4))
+    if interval_min <= 0 or interval_max < interval_min:
+        raise ValueError("Invalid reconstruction frame interval bounds")
+    gan = config.get("gan")
+    if not isinstance(gan, Mapping) or not bool(gan.get("enabled", False)):
+        raise ValueError("Libero reconstruction requires the VideoMAE GAN")
+    generator_start = int(gan["generator_start_epoch"])
+    discriminator_start = int(gan["discriminator_start_epoch"])
+    if generator_start != discriminator_start or generator_start != 30:
+        raise ValueError("VideoMAE generator and discriminator must start at epoch 30")
     return {
         "task": config["task"],
         "encoder": config["model"]["encoder"]["name"],
         "pool_group": config["model"]["pooling"]["group_size"],
         "attention_mode": config["model"]["decoder"]["attention_mode"],
-        "dataset": "lerobot",
+        "dataset": "lerobot_reconstruction",
         "ddp_gradient_compression": gradient_compression,
     }
 
@@ -299,6 +310,40 @@ def train(
     prepare_batch = batch_preparer or (
         lambda batch, device, _config: batch["video"].to(device, non_blocking=True)
     )
+    gan_config = dict(config["gan"])
+    gan_checkpoint = paths.checkpoint(
+        gan_config["discriminator_checkpoint"], require_exists=False
+    )
+
+    def build_discriminator() -> nn.Module:
+        if str(gan_config.get("input_range")) != "zero_one":
+            raise ValueError("VideoMAE discriminator input_range must be zero_one")
+        discriminator: nn.Module = VideoMAEDiscriminator(
+            gan_checkpoint,
+            taps=tuple(int(value) for value in gan_config["key_depths"]),
+            input_clamp=bool(gan_config["input_clamp"]),
+            head_kernel_size=int(gan_config["head_kernel_size"]),
+            head_norm_type=str(gan_config["head_norm_type"]),
+            spectral_norm_heads=bool(gan_config["spectral_norm"]),
+            norm_eps=float(gan_config["norm_eps"]),
+            diff_aug_prob=float(gan_config["diff_aug_prob"]),
+            diff_aug_cutout=float(gan_config["diff_aug_cutout"]),
+            temporal_sampling=str(gan_config.get("temporal_sampling", "strict")),
+        ).to(context.device)
+        if context.world_size > 1:
+            discriminator = DistributedDataParallel(
+                discriminator,
+                device_ids=[context.local_rank] if context.device.type == "cuda" else None,
+                broadcast_buffers=False,
+                find_unused_parameters=False,
+            )
+            configure_ddp_gradient_compression(
+                discriminator,
+                config["training"].get("ddp_gradient_compression", "none"),
+            )
+        return discriminator
+
+    gan = GANController(gan_config, build_discriminator, device=context.device)
     # # 梯度累积，例如 accumulation_steps=4：
     # 4 个 micro-batch 才执行一次 optimizer.step() 
     accumulation = GradientAccumulator(
@@ -359,8 +404,31 @@ def train(
             preview["model_metadata"],
             metadata_fields,
         )
+        checkpoint_epoch = int(preview["data_state"]["sampler_epoch"])
+        gan_runtime = preview.get("gan_runtime")
+        if not isinstance(gan_runtime, Mapping):
+            raise CheckpointError("Reconstruction checkpoint is missing gan_runtime state")
+        gan_initialized = bool(gan_runtime.get("initialized", False))
+        if (preview.get("gan") is not None) != gan_initialized:
+            raise CheckpointError("Checkpoint GAN parameters disagree with gan_runtime state")
+        loss_state = gan_runtime.get("loss_state")
+        if not isinstance(loss_state, Mapping):
+            raise CheckpointError("Reconstruction checkpoint is missing GAN loss state")
+        try:
+            gan.load_loss_state_dict(loss_state)
+        except (TypeError, ValueError) as error:
+            raise CheckpointError(f"Incompatible GAN loss state: {error}") from error
+        if gan_initialized:
+            gan.ensure_initialized(checkpoint_epoch)
+            constructed_epoch = gan_runtime.get("constructed_epoch")
+            if constructed_epoch is None or int(constructed_epoch) > checkpoint_epoch:
+                raise CheckpointError("Checkpoint GAN constructed_epoch is invalid")
+            gan.constructed_epoch = int(constructed_epoch)
         optimizer_objects: dict[str, Any] = {"generator": optimizer}
         scheduler_objects: dict[str, Any] = {"generator": scheduler}
+        if gan.optimizer is not None:
+            optimizer_objects["discriminator"] = gan.optimizer
+            scheduler_objects["discriminator"] = gan.scheduler
         # 恢复模型、EMA、优化器、scheduler、scaler、sampler 等状态
         payload = resume_training(
             resume_checkpoint,
@@ -377,6 +445,8 @@ def train(
         )
         accumulation.load_data_state(payload["data_state"])
         start_epoch, step = sampler.epoch, int(payload["step"])
+        if gan_initialized:
+            gan.discriminator.load_state_dict(payload["gan"], strict=True)
 
     if max_steps is not None and step >= int(max_steps):
         logger.finish()
@@ -397,6 +467,7 @@ def train(
     execution_metadata_recorded = False
     stop = False
     for epoch in range(start_epoch, int(config["training"]["epochs"])):
+        loader.dataset.set_epoch(epoch)
         batches = iter(loader)
         # 仅在默认 batch 预处理、CUDA 和显式开启时启用预取
         if (
@@ -412,11 +483,6 @@ def train(
             # 输入处理：
             # 默认是 batch["video"] -> 当前 device
             video = prepare_batch(batch, context.device, config)
-            # 可能的形状变化：
-            #   [B, V, ...] -> [B*V, ...]
-            # 其中 V 是多视角数量。
-            # 如果输入本来没有多视角维度，通常保持原形状。
-            video = flatten_multiview_video(video)
             # 第一次拿到真实 batch 时，保存固定输入样本
             if context.is_main and fixed_video is None:
                 sample_count = min(int(config["wandb"].get("sample_count", 4)), video.shape[0])
@@ -440,9 +506,26 @@ def train(
                     result = graph(video)
                     # result 至少包含 result["recon"]
                     total, metrics = loss_module(result["recon"], video)
+                    adversarial = (
+                        gan.generator_loss(result["recon"], epoch)
+                        if gan.active(epoch)
+                        else None
+                    )
+                    if adversarial is not None:
+                        total = total + float(gan_config["generator_weight"]) * adversarial
                     # total：用于反向传播的标量总损失
                     # metrics：各项损失或监控指标的字典
                 accumulation.backward(total, scaler)
+            if gan.active(epoch):
+                with precision.autocast():
+                    gan.discriminator_step(
+                        video,
+                        result["recon"],
+                        epoch=epoch,
+                        step=step,
+                        microstep=accumulation.microstep,
+                        accumulation_steps=accumulation.steps,
+                    )
             sampler.commit_batch()
             # 尚未积累够梯度时，继续读取下一个 micro-batch
             if not accumulation.advance():
@@ -464,6 +547,10 @@ def train(
             # 阶段 3/3：定期聚合和记录指标
             if step % log_interval == 0:
                 metric_tensors = {**metrics, "total": total.detach()}
+                if adversarial is not None:
+                    metric_tensors["generator_adversarial"] = adversarial.detach()
+                if gan.active(epoch):
+                    metric_tensors.update(gan.monitoring_metrics())
                 reduced_metrics = {
                     name: reduce_mean(value.detach()) for name, value in metric_tensors.items()
                 }
@@ -534,6 +621,9 @@ def train(
                 if context.is_main:
                     optimizer_objects: dict[str, Any] = {"generator": optimizer}
                     scheduler_objects: dict[str, Any] = {"generator": scheduler}
+                    if gan.optimizer is not None:
+                        optimizer_objects["discriminator"] = gan.optimizer
+                        scheduler_objects["discriminator"] = gan.scheduler
                     payload = build_training_checkpoint(
                         task="recon_training",
                         epoch=sampler.epoch,
@@ -550,6 +640,16 @@ def train(
                         model_metadata=model.metadata(),
                         rng_state=rng_state,
                     )
+                    payload["gan"] = (
+                        gan.discriminator.state_dict()
+                        if gan.discriminator is not None
+                        else None
+                    )
+                    payload["gan_runtime"] = {
+                        "initialized": gan.discriminator is not None,
+                        "constructed_epoch": gan.constructed_epoch,
+                        "loss_state": gan.loss_state_dict(),
+                    }
                     save_training_checkpoint(payload, run / "checkpoints")
                 last_saved_step = step
             if max_steps is not None and step >= max_steps:
@@ -563,6 +663,9 @@ def train(
         if context.is_main:
             optimizer_objects = {"generator": optimizer}
             scheduler_objects = {"generator": scheduler}
+            if gan.optimizer is not None:
+                optimizer_objects["discriminator"] = gan.optimizer
+                scheduler_objects["discriminator"] = gan.scheduler
             payload = build_training_checkpoint(
                 task="recon_training",
                 epoch=sampler.epoch,
@@ -579,6 +682,14 @@ def train(
                 model_metadata=model.metadata(),
                 rng_state=rng_state,
             )
+            payload["gan"] = (
+                gan.discriminator.state_dict() if gan.discriminator is not None else None
+            )
+            payload["gan_runtime"] = {
+                "initialized": gan.discriminator is not None,
+                "constructed_epoch": gan.constructed_epoch,
+                "loss_state": gan.loss_state_dict(),
+            }
             save_training_checkpoint(payload, run / "checkpoints")
     if context.is_main:
         update_decoder_execution_metadata(

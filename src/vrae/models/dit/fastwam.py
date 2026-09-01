@@ -171,8 +171,6 @@ class FastWAM(nn.Module):
         torch_dtype: torch.dtype = torch.bfloat16,
         video_dit_config: dict[str, Any] | None = None,
         action_dit_config: dict[str, Any] | None = None,
-        action_dit_pretrained_path: str | None = None,
-        skip_dit_load_from_pretrain: bool = False,
         text_encoder: nn.Module | None = None,
         tokenizer: Any | None = None,
         text_dim: int | None = None,
@@ -191,12 +189,9 @@ class FastWAM(nn.Module):
             raise ValueError("video_expert must be provided; V-RAE does not ship a Wan22 loader")
         if action_dit_config is None:
             raise ValueError("action_dit_config is required")
-        action_expert = ActionDiT.from_pretrained(
-            action_dit_config,
-            action_dit_pretrained_path,
-            skip_dit_load_from_pretrain,
+        action_expert = ActionDiT(**dict(action_dit_config)).to(
             device=device,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
         )
         mot = MoT(
             {"video": video_expert, "action": action_expert},

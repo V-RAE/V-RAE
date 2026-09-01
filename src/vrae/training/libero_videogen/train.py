@@ -23,8 +23,11 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
     validate_wandb_config(config["wandb"])
     if config.get("task") != "libero_videogen":
         raise ValueError("LIBERO generation requires task=libero_videogen")
-    if config["data"].get("dataset") != "lerobot":
-        raise ValueError("LIBERO generation requires data.dataset=lerobot")
+    dataset_name = str(config["data"].get("dataset", "lerobot"))
+    if dataset_name not in {"lerobot", "reconstruction"}:
+        raise ValueError(
+            "LIBERO generation requires data.dataset=lerobot or reconstruction"
+        )
 
     num_classes = int(config["dit"]["num_classes"])
     if num_classes <= 0:
@@ -63,7 +66,7 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("LIBERO generation requires runtime.data_pipeline.kind=lerobot_bounded")
     return {
         "task": config["task"],
-        "dataset": "lerobot",
+        "dataset": dataset_name,
         "num_classes": num_classes,
         "num_chunks": num_chunks,
         "num_views": num_views,
@@ -87,7 +90,11 @@ def ensure_latent_stats(config: Mapping[str, Any], paths: ProjectPaths) -> Path:
 
     if context.is_main:
         print(f"[latent-stats] computing LIBERO statistics: {output}", flush=True)
-    compute_class_conditional_latent_stats(config, paths, dataset_name="lerobot")
+    compute_class_conditional_latent_stats(
+        config,
+        paths,
+        dataset_name=str(config["data"].get("dataset", "lerobot")),
+    )
 
     failure: str | None = None
     if context.is_main and (not output.is_file() or output.stat().st_size == 0):
@@ -114,11 +121,12 @@ def main() -> None:
     ensure_latent_stats(initial_config, initial_paths)
     config, paths, run = prepare_run(arguments.config, arguments.paths)
     validate_build(config)
+    dataset_name = str(config["data"].get("dataset", "lerobot"))
     train_class_conditional(
         config,
         paths,
         run,
-        dataset_name="lerobot",
+        dataset_name=dataset_name,
         max_steps=arguments.max_steps,
     )
 

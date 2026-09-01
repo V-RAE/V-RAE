@@ -68,9 +68,9 @@ if config["task"] != "recon_training":
     raise SystemExit("task must be recon_training")
 if config["model"]["encoder"]["name"] != "vjepa2_1":
     raise SystemExit("only the V-JEPA 2.1 encoder is supported")
-if config["data"].get("dataset") != "lerobot":
-    raise SystemExit("data.dataset must be lerobot")
-print(json.dumps({"task": config["task"], "encoder": "vjepa2_1", "dataset": "lerobot"}))
+if config["data"].get("dataset") != "lerobot_reconstruction":
+    raise SystemExit("data.dataset must be lerobot_reconstruction")
+print(json.dumps({"task": config["task"], "encoder": "vjepa2_1", "dataset": "lerobot_reconstruction"}))
 PY
   printf 'command:'
   printf ' %q' "${launch_args[@]}"

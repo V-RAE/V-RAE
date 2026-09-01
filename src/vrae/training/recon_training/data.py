@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -8,12 +9,12 @@ from torch.utils.data import DataLoader
 
 from vrae.training.common.contracts import resolve_batch_contract
 from vrae.training.common.sampler import StatefulDistributedBatchSampler
-from vrae.data.lerobot import LeRobotVideoDataset
 from vrae.paths import ProjectPaths
+from vrae.data.reconstruction import ReconstructionDataset
 
 
 def flatten_multiview_video(video: torch.Tensor) -> torch.Tensor:
-    """Convert [B,T,V,C,H,W] clips to the single-view [B*V,T,C,H,W] layout."""
+    """Keep legacy evaluation callers working while reconstruction is single-view."""
 
     if video.ndim == 5:
         return video
@@ -63,16 +64,30 @@ class CudaVideoPrefetchIterator:
         return batch
 
 
-def build_reconstruction_dataset(config: Mapping[str, Any], paths: ProjectPaths) -> LeRobotVideoDataset:
+def build_reconstruction_dataset(
+    config: Mapping[str, Any], paths: ProjectPaths
+) -> ReconstructionDataset:
     data = config["data"]
     root_value = data.get("root")
     root = paths.dataset("lerobot") if not root_value else str(root_value)
-    return LeRobotVideoDataset(
+    manifest = data.get("manifest")
+    if not manifest:
+        raise ValueError("Reconstruction requires data.manifest")
+    manifest_path = Path(str(manifest))
+    if not manifest_path.is_absolute():
+        manifest_path = paths.project_root / manifest_path
+    return ReconstructionDataset(
         root,
+        manifest_path,
         repo_id=str(data.get("repo_id", "libero")),
-        frame_num=int(data.get("num_frames", 16)),
-        frame_interval=int(data.get("frame_interval", 1)),
-        camera_keys=data.get("camera_keys"),
+        num_frames=int(data.get("num_frames", 16)),
+        frame_interval=int(data.get("frame_interval", 3)),
+        random_frame_interval=bool(data.get("random_frame_interval", False)),
+        frame_interval_min=int(data.get("frame_interval_min", 1)),
+        frame_interval_max=int(data.get("frame_interval_max", 4)),
+        image_size=int(data.get("image_size", 256)),
+        random_flip=bool(data.get("random_flip", True)),
+        seed=int(data.get("seed", 3407)),
     )
 
 
@@ -81,9 +96,13 @@ def collate_reconstruction(items: list[dict[str, Any]]) -> dict[str, Any]:
         "video": torch.stack([item["video"] for item in items]),
         "label": torch.tensor([item["label"] for item in items], dtype=torch.long),
         "sample_id": [item["sample_id"] for item in items],
+        "view": [item["view"] for item in items],
+        "episode_index": torch.tensor(
+            [int(item["episode_index"]) for item in items], dtype=torch.long
+        ),
         "frame_indices": torch.stack([item["frame_indices"] for item in items]),
-        "decode_attempts": torch.tensor(
-            [int(item.get("decode_attempts", 1)) for item in items], dtype=torch.long
+        "frame_interval": torch.tensor(
+            [int(item["frame_interval"]) for item in items], dtype=torch.long
         ),
     }
     for key in ("state", "action"):

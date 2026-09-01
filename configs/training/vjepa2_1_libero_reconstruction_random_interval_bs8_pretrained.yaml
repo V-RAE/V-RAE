@@ -1,0 +1,11 @@
+include:
+  - vjepa2_1_libero_reconstruction_random_interval_bs8.yaml
+
+run_name: vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained
+training:
+  init_from: ckpts/pretrained/vrae/vrae_vjepa2.1.pt
+  init_weights: ema
+  resume: null
+wandb:
+  tags: [libero, reconstruction, vjepa2_1, single_view, random_interval, pretrained]
+  resume: never

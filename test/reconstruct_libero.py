@@ -29,7 +29,6 @@ from vrae.training.common.visualization import comparison_video, save_video_mp4
 from vrae.training.recon_training.data import (
     build_reconstruction_dataset,
     collate_reconstruction,
-    flatten_multiview_video,
 )
 
 
@@ -167,10 +166,11 @@ def reconstruct_libero(
     with torch.inference_mode():
         for batch in loader:
             real = batch["video"]
-            if real.ndim != 6:
-                raise ValueError(f"Expected multiview LIBERO video [B,T,V,C,H,W], got {tuple(real.shape)}")
-            batch_count, frames, views, channels, height, width = real.shape
-            model_input = flatten_multiview_video(real).to(selected_device, non_blocking=True)
+            if real.ndim != 5:
+                raise ValueError(f"Expected single-view LIBERO video [B,T,C,H,W], got {tuple(real.shape)}")
+            batch_count, frames, channels, height, width = real.shape
+            views = 1
+            model_input = real.to(selected_device, non_blocking=True)
             autocast = (
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                 if selected_device.type == "cuda"
@@ -179,17 +179,13 @@ def reconstruct_libero(
             with autocast:
                 reconstructed = model(model_input)["recon"]
             reconstructed = reconstructed.float().clamp(0.0, 1.0)
-            expected_shape = (batch_count * views, frames, channels, height, width)
+            expected_shape = (batch_count, frames, channels, height, width)
             if tuple(reconstructed.shape) != expected_shape:
                 raise ValueError(
                     f"Unexpected reconstruction shape {tuple(reconstructed.shape)}; "
                     f"expected {expected_shape}"
                 )
-            reconstructed = (
-                reconstructed.reshape(batch_count, views, frames, channels, height, width)
-                .permute(0, 2, 1, 3, 4, 5)
-                .cpu()
-            )
+            reconstructed = reconstructed.cpu()
 
             for item_index in range(batch_count):
                 clip_number = len(manifest)
@@ -201,20 +197,17 @@ def reconstruct_libero(
                     "task": batch.get("task", [None] * batch_count)[item_index],
                 }
                 item_manifest["videos"] = {}
-                for view_index, camera in enumerate(dataset.camera_keys):
-                    view_name = str(camera["name"]).replace("/", "_")
-                    output_path = _save_comparison_video(
-                        real[item_index, :, view_index],
-                        reconstructed[item_index, :, view_index],
-                        destination,
-                        fps=output_fps,
-                        clip_number=clip_number,
-                        view_name=view_name,
-                    )
-                    output_paths.append(output_path)
-                    item_manifest["videos"][view_name] = str(
-                        output_path.relative_to(destination)
-                    )
+                view_name = str(batch["view"][item_index]).replace("/", "_")
+                output_path = _save_comparison_video(
+                    real[item_index],
+                    reconstructed[item_index],
+                    destination,
+                    fps=output_fps,
+                    clip_number=clip_number,
+                    view_name=view_name,
+                )
+                output_paths.append(output_path)
+                item_manifest["videos"][view_name] = str(output_path.relative_to(destination))
                 manifest.append(item_manifest)
 
     manifest_path = destination / "manifest.json"

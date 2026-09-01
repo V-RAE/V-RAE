@@ -4,9 +4,10 @@ include:
 task: recon_training
 run_name: vjepa2_1_libero_reconstruction
 model:
+  multiview:
+    enabled: false
   decoder:
     init: scratch
-    attention_mode: full
     attention_mode: full
 training:
   init_from: null
@@ -31,6 +32,17 @@ training:
     apply_in_eval: false
   ema:
     decay: 0.9995
+data:
+  dataset: lerobot_reconstruction
+  manifest: data/metadata/libero_reconstruction.csv
+  num_frames: 16
+  frame_interval: 3
+  random_frame_interval: false
+  frame_interval_min: 1
+  frame_interval_max: 4
+  sampling: random
+  crop_mode: random
+  random_flip: true
 loss:
   l1: 1.0
   lpips: 1.0
@@ -40,10 +52,40 @@ loss:
   perceptual_chunk_size: 4
   backbone_checkpoint: ckpts/pretrained/perceptual/vgg16.pt
   calibration_checkpoint: ckpts/pretrained/perceptual/lpips_vgg.pt
+gan:
+  enabled: true
+  type: videomae
+  generator_start_epoch: 30
+  discriminator_start_epoch: 30
+  update_interval: 5
+  generator_weight: 0.3
+  discriminator_checkpoint: ckpts/pretrained/discriminators/videomae/vit_b_hybrid_pt_800e.pth
+  key_depths: [2, 5, 8, 11]
+  head_kernel_size: 9
+  head_norm_type: bn
+  spectral_norm: true
+  norm_eps: 1.0e-6
+  diff_aug_prob: 1.0
+  diff_aug_cutout: 0.2
+  gen_loss_type: ns_g_loss
+  disc_loss_type: ns_smooth
+  lecam: true
+  lecam_weight: 0.001
+  discriminator_weight: 0.3
+  input_range: zero_one
+  input_clamp: true
+  optimizer:
+    name: adamw
+    lr: 2.0e-5
+    betas: [0.9, 0.95]
+    weight_decay: 1.0e-4
+  scheduler:
+    name: constant
+    warmup_steps: 0
 wandb:
   project: V-RAE
   group: libero_reconstruction
-  tags: [libero, reconstruction, vjepa2_1, multiview]
+  tags: [libero, reconstruction, vjepa2_1, single_view]
   mode: online
   resume: allow
   log_interval: 20

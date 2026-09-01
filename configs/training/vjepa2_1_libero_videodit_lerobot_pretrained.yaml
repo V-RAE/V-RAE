@@ -1,0 +1,20 @@
+include:
+  - libero_videodit.yaml
+
+task: libero_videogen
+run_name: vjepa2_1_libero_videodit_lerobot_pretrained
+stage1:
+  checkpoint: ckpts/pretrained/vrae/vrae_vjepa2.1.pt
+  weights: ema
+  precision: bf16
+latent_normalizer:
+  path: ckpts/libero_videogen/latent_stats/vjepa2_1_libero_videodit_lerobot_pretrained_multiview.pt
+training:
+  resume: null
+  init_from: null
+  global_batch_size: 32
+  epochs: 3000
+wandb:
+  group: libero_videogen_lerobot_pretrained
+  tags: [libero, lerobot, multiview, vjepa2_1, pretrained]
+  resume: never

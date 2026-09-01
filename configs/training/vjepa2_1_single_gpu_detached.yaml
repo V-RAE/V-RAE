@@ -1,8 +1,0 @@
-include:
-  - vjepa2_1_single_gpu_optimized.yaml
-run_name: vjepa2_1_libero_reconstruction_single_gpu_bs4_50k_detached
-training:
-  init_from: null
-  resume: ckpts/recon_training/vjepa2_1_libero_reconstruction_single_gpu_bs4_50k_detached/checkpoints/step-00001000.pt
-wandb:
-  sample_interval: 2000

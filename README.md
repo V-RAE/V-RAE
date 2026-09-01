@@ -24,6 +24,8 @@ curl -fL https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt \
 ```
 
 重建 loss 使用 VGG/LPIPS 权重，下载方式见 [third_party/README.md](third_party/README.md)。
+VideoMAE GAN discriminator 权重也在该文档中，支持 OpenGVLab 的 ModelScope
+镜像下载；正式训练在 epoch 30 初始化 discriminator 前必须准备该文件。
 
 ## 数据与类别
 
