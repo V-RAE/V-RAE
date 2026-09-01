@@ -64,6 +64,24 @@ VJEPA_DRY_RUN=1 scripts/train/vjepa2_1.sh 1 1 0
 ckpts/recon_training/vjepa2_1_libero_reconstruction/checkpoints/latest.pt
 ```
 
+### Stage 1 视频重建评估
+
+先下载评估模型（I3D、Inception 和 LPIPS/VGG 权重）：
+
+```bash
+scripts/download_eval_weights.sh
+```
+
+对 LIBERO LeRobot 重建 checkpoint 计算 rFVD、LPIPS、PSNR 和 SSIM：
+
+```bash
+scripts/eval/libero_rfvd.sh --max-samples 8 --output outputs/libero_rfvd/eval.json
+```
+
+`--max-samples` 可用于快速 smoke 评估；省略时会评估配置中数据集的全部样本。默认使用
+`ckpts/recon_training/vjepa2_1_libero_reconstruction_single_gpu_bs4_50k_detached/checkpoints/step-00050000.pt`
+的 EMA 权重，也可通过 `--checkpoint` 指定其他 Stage 1 checkpoint。
+
 ## Stage 2：LIBERO VideoDiT 生成训练
 
 配置：`configs/training/libero_videodit.yaml`。它会读取 Stage 1 的 EMA 权重；latent mean/std 不存在时，会先从每个 episode 采样一个 clip，分布式计算通道统计量，然后开始 VideoDiT 训练。

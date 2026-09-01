@@ -71,6 +71,7 @@ def build_reconstruction_dataset(config: Mapping[str, Any], paths: ProjectPaths)
         root,
         repo_id=str(data.get("repo_id", "libero")),
         frame_num=int(data.get("num_frames", 16)),
+        frame_interval=int(data.get("frame_interval", 1)),
         camera_keys=data.get("camera_keys"),
     )
 

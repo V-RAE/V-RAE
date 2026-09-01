@@ -1,0 +1,5 @@
+include:
+  - libero_videodit_from_recon_50k_benchmark.yaml
+
+training:
+  resume: ckpts/libero_videogen/vjepa2_1_libero_videodit_from_recon_50k_benchmark_bs48/checkpoints/latest.pt

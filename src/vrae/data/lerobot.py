@@ -19,6 +19,18 @@ DEFAULT_PROMPT = (
 )
 
 
+def build_temporal_indices(frame_num: int, frame_interval: int) -> list[int]:
+    """Return source-frame offsets for a fixed-length sampled clip."""
+
+    frame_num = int(frame_num)
+    frame_interval = int(frame_interval)
+    if frame_num <= 0 or frame_num % 4:
+        raise ValueError("frame_num must be a positive multiple of 4")
+    if frame_interval <= 0:
+        raise ValueError("frame_interval must be positive")
+    return [frame_interval * index for index in range(frame_num)]
+
+
 class LeRobotVideoDataset(LeRobotDataset):
     """Expose LeRobot's native frame loader as V-JEPA 2.1 video samples.
 
@@ -32,6 +44,7 @@ class LeRobotVideoDataset(LeRobotDataset):
         *,
         repo_id: str = "libero",
         frame_num: int = 16,
+        frame_interval: int = 1,
         camera_keys: Sequence[Mapping[str, Any]] | None = None,
     ) -> None:
         super().__init__(repo_id, root=Path(root))
@@ -46,10 +59,9 @@ class LeRobotVideoDataset(LeRobotDataset):
             ]
         )
         self.frame_num = int(frame_num)
-        if self.frame_num <= 0 or self.frame_num % 4:
-            raise ValueError("frame_num must be a positive multiple of 4")
+        self.frame_interval = int(frame_interval)
         self.camera_keys = self._resolve_camera_keys(camera_keys)
-        temporal_indices = list(range(self.frame_num))
+        temporal_indices = build_temporal_indices(self.frame_num, self.frame_interval)
         self.delta_indices = {
             camera["key"]: temporal_indices for camera in self.camera_keys
         }
@@ -141,7 +153,7 @@ class LeRobotVideoDataset(LeRobotDataset):
         episode_start = int(episode_meta["dataset_from_index"])
         episode_stop = int(episode_meta["dataset_to_index"])
         current_index = int(item["index"])
-        global_indices = torch.arange(self.frame_num, dtype=torch.long)
+        global_indices = torch.tensor(self.delta_indices[self.camera_keys[0]["key"]])
         global_indices = (current_index + global_indices).clamp(
             min=episode_start,
             max=episode_stop - 1,

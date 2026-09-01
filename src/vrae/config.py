@@ -122,6 +122,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
             raise ConfigError("model.multiview requires 0 < num_views <= num_streams")
     data = config.get("data", {})
     if isinstance(data, Mapping):
+        if int(data.get("frame_interval", 1)) <= 0:
+            raise ConfigError("data.frame_interval must be positive")
         if str(data.get("dataset", "")) == "lerobot":
             cameras = data.get("camera_keys")
             if (

@@ -1,0 +1,13 @@
+task: libero_rfvd
+run:
+  name: libero-rfvd
+checkpoints:
+  stage1: ckpts/recon_training/vjepa2_1_libero_reconstruction_single_gpu_bs4_50k_detached/checkpoints/step-00050000.pt
+extractors:
+  i3d: ckpts/eval_models/i3d_torchscript.pt
+  lpips: ckpts/pretrained/perceptual/lpips_vgg.pt
+evaluation:
+  weights: ema
+  batch_size: 1
+  metric_batch_size: 8
+  num_workers: 0

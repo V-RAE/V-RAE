@@ -3,6 +3,20 @@
 from torch.utils.data import DataLoader
 
 from vrae.data import LeRobotVideoDataset
+from vrae.data.lerobot import build_temporal_indices
+
+
+def test_build_temporal_indices_uses_frame_interval() -> None:
+    assert build_temporal_indices(16, 4) == list(range(0, 64, 4))
+
+
+def test_build_temporal_indices_rejects_non_positive_interval() -> None:
+    try:
+        build_temporal_indices(16, 0)
+    except ValueError as error:
+        assert "frame_interval" in str(error)
+    else:
+        raise AssertionError("expected frame_interval validation to fail")
 
 
 def _describe(name: str, value: object) -> None:

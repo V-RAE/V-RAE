@@ -231,7 +231,7 @@ def train(
     )
     # 只把模型中允许训练的模块注册进 ModuleDict
     trainable = nn.ModuleDict(model.trainable_groups())
-    # 可能执行预训练权重加载、模块初始化或冻结参数等操作(check)
+    # 可能执行预训练权重加载、模块初始化或冻结参数等操作
     initialization = _initialize_model(
         config,
         paths,
@@ -272,7 +272,7 @@ def train(
         str(config["training"].get("precision", "bf16")), context.device.type
     )
     scaler = precision.make_scaler()
-    # (check)
+
     loss_module = ReconstructionLoss(_resolve_loss_config(config, paths)).to(context.device)
     if bool(config["training"].get("compile_reconstruction_loss", False)):
         loss_module.enable_compile(
@@ -300,7 +300,7 @@ def train(
         lambda batch, device, _config: batch["video"].to(device, non_blocking=True)
     )
     # # 梯度累积，例如 accumulation_steps=4：
-    # 4 个 micro-batch 才执行一次 optimizer.step() (check)
+    # 4 个 micro-batch 才执行一次 optimizer.step() 
     accumulation = GradientAccumulator(
         int(config["training"].get("gradient_accumulation_steps", 1))
     )
@@ -361,7 +361,7 @@ def train(
         )
         optimizer_objects: dict[str, Any] = {"generator": optimizer}
         scheduler_objects: dict[str, Any] = {"generator": scheduler}
-        # 恢复模型、EMA、优化器、scheduler、scaler、sampler 等状态(check)
+        # 恢复模型、EMA、优化器、scheduler、scaler、sampler 等状态
         payload = resume_training(
             resume_checkpoint,
             model=model,
@@ -409,10 +409,10 @@ def train(
             # 一个梯度累积周期的第一个 micro-step 才清空梯度
             if accumulation.is_first_microstep:
                 optimizer.zero_grad(set_to_none=True)
-            # 输入处理：(check)
+            # 输入处理：
             # 默认是 batch["video"] -> 当前 device
             video = prepare_batch(batch, context.device, config)
-            # 可能的形状变化：(check)
+            # 可能的形状变化：
             #   [B, V, ...] -> [B*V, ...]
             # 其中 V 是多视角数量。
             # 如果输入本来没有多视角维度，通常保持原形状。

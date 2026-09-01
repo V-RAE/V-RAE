@@ -123,15 +123,8 @@ junit*.xml
 *.gif
 *.webp
 
-# Canonical dataset manifests required by the training and validation configs.
-# Keep every other dataset artifact under data/ ignored.
-!/data/
-/data/*
-!/data/metadata/
-/data/metadata/*
-!/data/metadata/ucf101_train_split1.csv
-!/data/metadata/k600_train.csv
-!/data/metadata/k600_val.csv
+# Keep all local dataset artifacts under data/ ignored.
+/data/
 
 # README and project media are release assets, not dataset content.
 !/assets/

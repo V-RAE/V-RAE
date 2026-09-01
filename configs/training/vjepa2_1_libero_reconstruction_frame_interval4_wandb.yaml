@@ -1,0 +1,19 @@
+include:
+  - vjepa2_1_single_gpu_optimized.yaml
+
+run_name: vjepa2_1_libero_reconstruction_frame_interval4_wandb
+data:
+  frame_interval: 4
+training:
+  init_from: null
+  resume: null
+  global_batch_size: 4
+  epochs: 50
+  checkpoint_interval: 1000
+wandb:
+  mode: online
+  project: V-RAE
+  group: libero_reconstruction
+  tags: [libero, reconstruction, vjepa2_1, multiview, frame_interval4]
+  resume: never
+  sample_interval: 2000

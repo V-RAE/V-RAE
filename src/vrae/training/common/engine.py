@@ -263,6 +263,7 @@ class ClassConditionalVideoDataset:
             root,
             repo_id=str(data.get("repo_id", "libero")),
             frame_num=int(data["num_frames"]),
+            frame_interval=int(data.get("frame_interval", 1)),
             camera_keys=data.get("camera_keys"),
         )
 
@@ -376,6 +377,12 @@ def load_frozen_stage1(config: Mapping[str, Any], paths: ProjectPaths, device: t
     ), payload
 
 
+def episode_start_indices(dataset: Any) -> list[int]:
+    """Select the first valid clip index from each LeRobot episode."""
+
+    return [int(episode["dataset_from_index"]) for episode in dataset.meta.episodes]
+
+
 def compute_class_conditional_latent_stats(
     config: Mapping[str, Any],
     paths: ProjectPaths,
@@ -393,7 +400,8 @@ def compute_class_conditional_latent_stats(
     # checkpoint state for the lifetime of the training process.
     del stage1_checkpoint_payload
     dataset = ClassConditionalVideoDataset.build(config, paths, dataset_name)
-    local_indices = list(range(context.rank, len(dataset), context.world_size))
+    clip_indices = episode_start_indices(dataset)
+    local_indices = clip_indices[context.rank :: context.world_size]
     global_batch = int(config["training"]["global_batch_size"])
     if global_batch <= 0:
         raise ValueError("training.global_batch_size must be positive")
@@ -601,6 +609,7 @@ def train_class_conditional(
     )
     from vrae.training.common.optim import build_optimizer, build_scheduler
     from vrae.training.common.precision import PrecisionPolicy
+    from vrae.training.common.profiler import TrainingProfiler
     from vrae.training.common.visualization import save_sample_tensors, video_to_uint8
     from vrae.training.common.wandb import WandbLogger
 
@@ -792,29 +801,18 @@ def train_class_conditional(
     last_saved_step = step
     stop = False
     memory_guard_message: str | None = None
-    data_wait_seconds = 0.0
-    data_wait_max_seconds = 0.0
-    data_wait_batches = 0
+    profiler = TrainingProfiler(context.device)
     throughput_window_started_at = time.perf_counter()
     throughput_window_updates = 0
-    cuda_batch_events: list[tuple[torch.cuda.Event, ...]] = []
-    cuda_update_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
     for epoch in range(start_epoch, epochs):
         batch_requested_at = time.perf_counter()
         for batch in loader:
             batch_received_at = time.perf_counter()
             data_wait = batch_received_at - batch_requested_at
-            data_wait_seconds += data_wait
-            data_wait_max_seconds = max(data_wait_max_seconds, data_wait)
-            data_wait_batches += 1
+            profiler.record_data_wait(data_wait)
             if accumulation.is_first_microstep:
                 optimizer.zero_grad(set_to_none=True)
-            if context.device.type == "cuda":
-                transfer_started = torch.cuda.Event(enable_timing=True)
-                transfer_finished = torch.cuda.Event(enable_timing=True)
-                stage1_finished = torch.cuda.Event(enable_timing=True)
-                backward_finished = torch.cuda.Event(enable_timing=True)
-                transfer_started.record()
+            profiler.begin_batch()
             video = batch["video"].to(context.device, non_blocking=True)
             if video.dtype == torch.uint8:
                 video = video.float().div_(255.0)
@@ -830,8 +828,7 @@ def train_class_conditional(
                 stream_ids = stream_ids.to(context.device, non_blocking=True)
             else:
                 stream_ids = None
-            if context.device.type == "cuda":
-                transfer_finished.record()
+            profiler.finish_h2d()
             with torch.no_grad():
                 flat_grid = stage1.encode_grid(flat_video)
                 flat_tokens = stage1.grid_to_tokens(flat_grid)
@@ -847,8 +844,7 @@ def train_class_conditional(
                 else:
                     clean = flat_tokens
                 clean = normalizer.normalize(clean)
-            if context.device.type == "cuda":
-                stage1_finished.record()
+            profiler.finish_stage1()
             with accumulation.sync_context(model):
                 with precision.autocast():
                     losses = transport.training_losses(
@@ -865,16 +861,7 @@ def train_class_conditional(
                     )
                     loss = losses["loss"]
                 accumulation.backward(loss, scaler)
-            if context.device.type == "cuda":
-                backward_finished.record()
-                cuda_batch_events.append(
-                    (
-                        transfer_started,
-                        transfer_finished,
-                        stage1_finished,
-                        backward_finished,
-                    )
-                )
+            profiler.finish_backward()
             sampler.commit_batch()
             if not accumulation.advance():
                 batch_requested_at = time.perf_counter()
@@ -889,16 +876,11 @@ def train_class_conditional(
                 continue
             scheduler.step()
             ema.update(dit)
-            if context.device.type == "cuda":
-                update_finished = torch.cuda.Event(enable_timing=True)
-                update_finished.record()
-                cuda_update_events.append((backward_finished, update_finished))
+            profiler.finish_update()
             step += 1
             throughput_window_updates += 1
             log_interval = int(config["wandb"]["log_interval"])
             if step % log_interval == 0:
-                if context.device.type == "cuda":
-                    torch.cuda.synchronize(context.device)
                 window_seconds = time.perf_counter() - throughput_window_started_at
                 reduced_losses = reduce_mean(
                     torch.stack(
@@ -910,90 +892,32 @@ def train_class_conditional(
                     ).detach()
                 )
                 reduced_loss, reduced_loss_full, reduced_loss_base = reduced_losses.unbind()
-                timing_sum_count = torch.tensor(
-                    [data_wait_seconds, float(data_wait_batches)],
-                    dtype=torch.float64,
-                    device=context.device,
+                profile_metrics = profiler.summarize(
+                    window_seconds=window_seconds,
+                    updates=throughput_window_updates,
+                    global_batch_size=batch_contract.global_batch_size,
                 )
-                timing_max = torch.tensor(
-                    [data_wait_max_seconds, window_seconds],
-                    dtype=torch.float64,
-                    device=context.device,
-                )
-                if cuda_batch_events:
-                    profile_values = torch.tensor(
-                        [
-                            sum(
-                                start.elapsed_time(copied)
-                                for start, copied, _, _ in cuda_batch_events
-                            ),
-                            sum(
-                                copied.elapsed_time(encoded)
-                                for _, copied, encoded, _ in cuda_batch_events
-                            ),
-                            sum(
-                                encoded.elapsed_time(backward)
-                                for _, _, encoded, backward in cuda_batch_events
-                            ),
-                            sum(start.elapsed_time(end) for start, end in cuda_update_events),
-                            float(len(cuda_batch_events)),
-                            float(len(cuda_update_events)),
-                        ],
-                        dtype=torch.float64,
-                        device=context.device,
-                    )
-                else:
-                    profile_values = torch.zeros(6, dtype=torch.float64, device=context.device)
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    torch.distributed.all_reduce(timing_sum_count)
-                    torch.distributed.all_reduce(
-                        timing_max,
-                        op=torch.distributed.ReduceOp.MAX,
-                    )
-                    torch.distributed.all_reduce(profile_values)
                 host_metrics = (
                     distributed_host_memory_metrics(context.device)
                     if log_host_memory or min_host_available_gb > 0.0
                     else {}
                 )
-                mean_data_wait_ms = float(
-                    (timing_sum_count[0] / timing_sum_count[1].clamp_min(1)).item() * 1000
-                )
-                max_data_wait_ms = float(timing_max[0].item() * 1000)
-                updates_per_second = throughput_window_updates / max(
-                    float(timing_max[1].item()), 1e-9
-                )
+                updates_per_second = profile_metrics["train/updates_per_second"]
                 ms_per_step = 1000.0 / updates_per_second
-                samples_per_second = updates_per_second * batch_contract.global_batch_size
-                batch_profile_count = max(float(profile_values[4].item()), 1.0)
-                update_profile_count = max(float(profile_values[5].item()), 1.0)
-                h2d_ms = float(profile_values[0].item() / batch_profile_count)
-                stage1_ms = float(profile_values[1].item() / batch_profile_count)
-                dit_ms = float(profile_values[2].item() / batch_profile_count)
-                update_ms = float(profile_values[3].item() / update_profile_count)
                 min_available_gb = host_metrics.get("memory/host_available_min_gb")
                 memory_guard_triggered = (
                     min_host_available_gb > 0.0
                     and min_available_gb is not None
                     and min_available_gb < min_host_available_gb
                 )
-                data_wait_seconds = 0.0
-                data_wait_max_seconds = 0.0
-                data_wait_batches = 0
                 reset_throughput_window = True
             else:
                 reduced_loss = None
                 reduced_loss_full = None
                 reduced_loss_base = None
-                mean_data_wait_ms = None
-                max_data_wait_ms = None
                 updates_per_second = None
                 ms_per_step = None
-                samples_per_second = None
-                h2d_ms = None
-                stage1_ms = None
-                dit_ms = None
-                update_ms = None
+                profile_metrics = {}
                 host_metrics = {}
                 min_available_gb = None
                 memory_guard_triggered = False
@@ -1011,6 +935,28 @@ def train_class_conditional(
                     ),
                     flush=True,
                 )
+                print(
+                    "[profile] "
+                    f"data_wait={profile_metrics['train/data_wait_ms_mean']:.1f}ms "
+                    f"h2d={profile_metrics['train/h2d_ms']:.1f}ms "
+                    f"stage1={profile_metrics['train/stage1_ms']:.1f}ms "
+                    f"dit={profile_metrics['train/dit_ms']:.1f}ms "
+                    f"update={profile_metrics['train/update_ms']:.1f}ms "
+                    f"allocated={profile_metrics['memory/allocated_gb']:.1f}GiB "
+                    f"reserved={profile_metrics['memory/reserved_gb']:.1f}GiB "
+                    f"peak={profile_metrics['memory/max_allocated_gb']:.1f}GiB",
+                    flush=True,
+                )
+                print(
+                    "[memory-phases] allocated="
+                    f"{profile_metrics['memory/batch_start_allocated_gb_mean']:.1f}/"
+                    f"{profile_metrics['memory/after_h2d_allocated_gb_mean']:.1f}/"
+                    f"{profile_metrics['memory/after_stage1_allocated_gb_mean']:.1f}/"
+                    f"{profile_metrics['memory/after_backward_allocated_gb_mean']:.1f}/"
+                    f"{profile_metrics['memory/after_update_allocated_gb_mean']:.1f}GiB "
+                    "(batch_start/h2d/stage1/backward/update)",
+                    flush=True,
+                )
                 logger.log(
                     {
                         "train/loss": float(reduced_loss.item()),
@@ -1022,31 +968,9 @@ def train_class_conditional(
                         "train/learning_rate": optimizer.param_groups[0]["lr"],
                         "train/step_time_sec": 1.0 / updates_per_second,
                         "train/steps_per_sec": updates_per_second,
-                        "train/samples_per_sec": samples_per_second,
                         "train/global_batch_size": batch_contract.global_batch_size,
-                        "train/data_wait_ms_mean": mean_data_wait_ms,
-                        "train/data_wait_ms_max": max_data_wait_ms,
-                        "train/updates_per_second": updates_per_second,
-                        "train/samples_per_second": samples_per_second,
-                        "train/h2d_ms": h2d_ms,
-                        "train/stage1_ms": stage1_ms,
-                        "train/dit_ms": dit_ms,
-                        "train/update_ms": update_ms,
+                        **profile_metrics,
                         **host_metrics,
-                        **(
-                            {
-                                "memory/allocated_gb": torch.cuda.memory_allocated(context.device)
-                                / (1024**3),
-                                "memory/reserved_gb": torch.cuda.memory_reserved(context.device)
-                                / (1024**3),
-                                "memory/max_allocated_gb": torch.cuda.max_memory_allocated(
-                                    context.device
-                                )
-                                / (1024**3),
-                            }
-                            if context.device.type == "cuda"
-                            else {}
-                        ),
                     },
                     step=step,
                 )
@@ -1184,8 +1108,7 @@ def train_class_conditional(
             if reset_throughput_window:
                 throughput_window_started_at = time.perf_counter()
                 throughput_window_updates = 0
-                cuda_batch_events.clear()
-                cuda_update_events.clear()
+                profiler.reset()
             batch_requested_at = time.perf_counter()
         if stop:
             break
