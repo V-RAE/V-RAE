@@ -1,0 +1,5 @@
+include:
+  - vjepa2_1_libero_videodit_lerobot_pretrained.yaml
+run_name: vjepa2_1_libero_videodit_high_util
+training:
+  global_batch_size: 48

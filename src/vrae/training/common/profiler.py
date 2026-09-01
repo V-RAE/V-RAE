@@ -150,6 +150,9 @@ class TrainingProfiler:
         elapsed = max(float(max_tensor[1].item()), 1.0e-9)
         updates_per_second = int(updates) / elapsed
         metrics = {
+            "train/window_elapsed_sec": elapsed,
+            "train/window_updates": float(updates),
+            "train/profiled_batches": float(sum_tensor[6].item()),
             "train/data_wait_ms_mean": float(
                 wait_seconds.item()
                 / wait_batches.clamp_min(1).item()

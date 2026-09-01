@@ -830,9 +830,16 @@ def train_class_conditional(
     stop = False
     memory_guard_message: str | None = None
     profiler = TrainingProfiler(context.device)
+    training_started_at = time.perf_counter()
     throughput_window_started_at = time.perf_counter()
     throughput_window_updates = 0
     for epoch in range(start_epoch, epochs):
+        epoch_started_at = time.perf_counter()
+        if context.is_main:
+            print(
+                f"[epoch-start] epoch={epoch} step={step} steps_per_epoch={steps_per_epoch}",
+                flush=True,
+            )
         set_epoch = getattr(loader.dataset, "set_epoch", None)
         if callable(set_epoch):
             set_epoch(epoch)
@@ -968,6 +975,8 @@ def train_class_conditional(
                 )
                 print(
                     "[profile] "
+                    f"window={profile_metrics['train/window_elapsed_sec']:.2f}s "
+                    f"updates={int(profile_metrics['train/window_updates'])} "
                     f"data_wait={profile_metrics['train/data_wait_ms_mean']:.1f}ms "
                     f"h2d={profile_metrics['train/h2d_ms']:.1f}ms "
                     f"stage1={profile_metrics['train/stage1_ms']:.1f}ms "
@@ -1048,6 +1057,7 @@ def train_class_conditional(
             sample_interval = int(config["wandb"]["sample_interval"])
             if step % sample_interval == 0:
                 if context.is_main:
+                    sample_started_at = time.perf_counter()
                     sample_count = int(config["wandb"].get("sample_count", 4))
                     sample_ids = [step * sample_count + index for index in range(sample_count)]
                     configured_class_ids = config["sampling"].get("class_ids")
@@ -1106,8 +1116,13 @@ def train_class_conditional(
                         stage1.decoder_execution_metadata(),
                         training_dtype=precision.name,
                     )
+                    print(
+                        f"[sample] step={step} elapsed={time.perf_counter() - sample_started_at:.2f}s",
+                        flush=True,
+                    )
                 barrier()
             if step % checkpoint_interval == 0:
+                checkpoint_started_at = time.perf_counter()
                 rng_state = gather_rng_states()
                 if context.is_main:
                     payload = build_training_checkpoint(
@@ -1133,6 +1148,11 @@ def train_class_conditional(
                     )
                     del payload
                 last_saved_step = step
+                if context.is_main:
+                    print(
+                        f"[checkpoint] step={step} elapsed={time.perf_counter() - checkpoint_started_at:.2f}s",
+                        flush=True,
+                    )
             if max_steps is not None and step >= max_steps:
                 stop = True
                 break
@@ -1146,8 +1166,14 @@ def train_class_conditional(
         release_epoch_memory = getattr(loader, "release_epoch_memory", None)
         if callable(release_epoch_memory):
             release_epoch_memory()
+        if context.is_main:
+            print(
+                f"[epoch-end] epoch={epoch} elapsed={time.perf_counter() - epoch_started_at:.2f}s step={step}",
+                flush=True,
+            )
     if step > 0 and step != last_saved_step:
         accumulation.require_boundary()
+        checkpoint_started_at = time.perf_counter()
         rng_state = gather_rng_states()
         if context.is_main:
             payload = build_training_checkpoint(
@@ -1172,10 +1198,20 @@ def train_class_conditional(
                 drop_page_cache=checkpoint_drop_page_cache,
             )
             del payload
+        if context.is_main:
+            print(
+                f"[checkpoint] step={step} elapsed={time.perf_counter() - checkpoint_started_at:.2f}s",
+                flush=True,
+            )
     close_loader = getattr(loader, "close", None)
     if callable(close_loader):
         close_loader()
     logger.finish()
+    if context.is_main:
+        print(
+            f"[training-end] step={step} elapsed={time.perf_counter() - training_started_at:.2f}s",
+            flush=True,
+        )
     if memory_guard_message is not None:
         raise RuntimeError(memory_guard_message)
 
