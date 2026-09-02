@@ -39,10 +39,13 @@ python -m vrae.training.libero_videogen.train \
 
 | 配置 | step 平均 | data wait | H2D | RAE/stage1 | DiT | peak 显存 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| baseline（1 解码线程、预取 1） | 8.10s | 720.0ms | 19.4ms | 1.327s | 5.761s | 45.8GiB |
+| baseline（原 run，8 解码线程、32/4/2 队列） | 8.10s | 720.0ms | 19.4ms | 1.327s | 5.761s | 45.8GiB |
+| baseline_serial（1 解码线程、1/2/1 队列） | 29.38s | 25.662s | 21.3ms | 706ms | 3.088s | 45.8GiB |
 | optimized（8 解码线程、32/4/2 队列） | 8.49s | 816.5ms | 20.1ms | 1.330s | 6.051s | 45.8GiB |
 
-两次运行 loss 均为 `2.572266`（step 10），无 OOM、NaN 或解码错误。10 步样本不足以证明吞吐提升；本机结果显示增加解码并发反而略慢，因此默认保留 bounded loader 的有限队列实现，但不继续扩大线程/队列。两次运行均生成了 step-00000010 checkpoint，路径在 `ckpts/libero_videogen/smoke/libero_videogen/` 下。
+三次运行 loss 均为 `2.572266`（step 10），无 OOM、NaN 或解码错误。串行对照的 data wait 占 step 约 87%，验证了有限并发预取对训练连续性的必要性；8/32/4/2 配置作为最终 smoke 方案，global batch 仍为 32。10 步样本不足以宣称稳定吞吐提升，正式训练前应按 PLAN 增加重复次数。
+
+最终采用 `vjepa2_1_libero_videodit_smoke_optimized.yaml`；串行配置仅用于诊断，不作为默认训练配置。
 
 ## 第 2 阶段：细粒度 profiler API
 
