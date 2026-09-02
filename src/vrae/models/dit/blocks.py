@@ -35,6 +35,31 @@ def modulate(value: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> t
     return value * (1 + scale) + shift
 
 
+def _fuse_legacy_linear_state(
+    state_dict: dict[str, torch.Tensor],
+    prefix: str,
+    fused_name: str,
+    legacy_names: tuple[str, ...],
+) -> None:
+    """Combine legacy Linear parameters along the output dimension."""
+    for parameter_name in ("weight", "bias"):
+        fused_key = f"{prefix}{fused_name}.{parameter_name}"
+        legacy_keys = [
+            f"{prefix}{legacy_name}.{parameter_name}"
+            for legacy_name in legacy_names
+        ]
+        if fused_key in state_dict:
+            continue
+        if not all(key in state_dict for key in legacy_keys):
+            continue
+        state_dict[fused_key] = torch.cat(
+            [state_dict[key] for key in legacy_keys],
+            dim=0,
+        )
+        for key in legacy_keys:
+            state_dict.pop(key)
+
+
 class RMSNorm(nn.Module):
     """RMS normalization evaluated in fp32 and returned in the input dtype."""
 
@@ -54,12 +79,28 @@ class RMSNorm(nn.Module):
 class SwiGLUFeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int) -> None:
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim)
-        self.w2 = nn.Linear(dim, hidden_dim)
+        self.w12 = nn.Linear(dim, hidden_dim * 2)
         self.w3 = nn.Linear(hidden_dim, dim)
+        self.register_load_state_dict_pre_hook(self._load_legacy_w12)
+
+    @staticmethod
+    def _load_legacy_w12(
+        module: nn.Module,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        *args: object,
+    ) -> None:
+        _fuse_legacy_linear_state(state_dict, prefix, "w12", ("w1", "w2"))
+        _fuse_legacy_linear_state(
+            state_dict,
+            prefix,
+            "w12",
+            ("gate_proj", "up_proj"),
+        )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        return self.w3(F.silu(self.w1(value)) * self.w2(value))
+        first, second = self.w12(value).chunk(2, dim=-1)
+        return self.w3(F.silu(first) * second)
 
 
 # The shorter name matches the public DDT reference.
@@ -126,12 +167,26 @@ class QKNormAttention(nn.Module):
         self.rope_theta = float(rope_theta)
         self.attention_dropout = float(attention_dropout)
         self.attention_backend = attention_backend
-        self.q = nn.Linear(self.dim, self.dim)
-        self.k = nn.Linear(self.dim, self.dim)
-        self.v = nn.Linear(self.dim, self.dim)
+        self.qkv = nn.Linear(self.dim, self.dim * 3)
         self.proj = nn.Linear(self.dim, self.dim)
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
+        self.register_load_state_dict_pre_hook(self._load_legacy_qkv)
+
+    @staticmethod
+    def _load_legacy_qkv(
+        module: nn.Module,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        *args: object,
+    ) -> None:
+        _fuse_legacy_linear_state(state_dict, prefix, "qkv", ("q", "k", "v"))
+        _fuse_legacy_linear_state(
+            state_dict,
+            prefix,
+            "qkv",
+            ("q_proj", "k_proj", "v_proj"),
+        )
 
     def forward(
         self,
@@ -148,9 +203,17 @@ class QKNormAttention(nn.Module):
             raise ValueError(
                 f"positions must have shape [{length},3], got {tuple(positions.shape)}"
             )
-        q = self.q(value).reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k(value).reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v(value).reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
+        qkv = self.qkv(value).reshape(
+            batch,
+            length,
+            3,
+            self.num_heads,
+            self.head_dim,
+        )
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
         q = self.q_norm(q)
         k = self.k_norm(k)
         if rope_cache is None:
