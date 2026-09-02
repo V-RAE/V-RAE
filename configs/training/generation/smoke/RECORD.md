@@ -34,3 +34,12 @@ python -m vrae.training.libero_videogen.train \
 ## 第 3 阶段：在线数据流水线优化
 
 `vjepa2_1_libero_videodit_smoke_optimized.yaml` 使用 8 个解码线程、32 个 in-flight 样本、4 个 batch 缓冲和 2 个异步预取 batch，仍保持 global batch 32。优化仅作用于短生命周期内存队列、pinned host batch 和 non-blocking H2D，不保存 RAE latent 到磁盘。
+
+### 10 步实测（2026-09-02，单张 H100 80GB）
+
+| 配置 | step 平均 | data wait | H2D | RAE/stage1 | DiT | peak 显存 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline（1 解码线程、预取 1） | 8.10s | 720.0ms | 19.4ms | 1.327s | 5.761s | 45.8GiB |
+| optimized（8 解码线程、32/4/2 队列） | 8.49s | 816.5ms | 20.1ms | 1.330s | 6.051s | 45.8GiB |
+
+两次运行 loss 均为 `2.572266`（step 10），无 OOM、NaN 或解码错误。10 步样本不足以证明吞吐提升；本机结果显示增加解码并发反而略慢，因此默认保留 bounded loader 的有限队列实现，但不继续扩大线程/队列。两次运行均生成了 step-00000010 checkpoint，路径在 `ckpts/libero_videogen/smoke/libero_videogen/` 下。

@@ -78,7 +78,11 @@ def ensure_latent_stats(config: Mapping[str, Any], paths: ProjectPaths) -> Path:
     from vrae.training.common.distributed import broadcast_object, initialize_distributed
 
     context = initialize_distributed()
-    output = paths.checkpoint(config["latent_normalizer"]["path"], require_exists=False)
+    stats_relative_path = config["latent_normalizer"]["path"]
+    try:
+        output = paths.checkpoint(stats_relative_path, require_exists=True)
+    except FileNotFoundError:
+        output = paths.checkpoint(stats_relative_path, require_exists=False)
     missing: bool | None = None
     if context.is_main:
         missing = not output.is_file() or output.stat().st_size == 0
