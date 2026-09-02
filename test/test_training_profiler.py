@@ -34,6 +34,29 @@ class TrainingProfilerTest(TestCase):
         run_fine_profile(calls.append, steps=3)
         self.assertEqual(calls, [0, 1, 2])
 
+    def test_decorator_registers_gpu_and_duration_phases(self) -> None:
+        profiler = TrainingProfiler(torch.device("cpu"), gpu_util_enabled=True)
+
+        @profiler("stage1", gpu_util=True)
+        def stage1(value: int) -> int:
+            return value + 1
+
+        @profiler("update")
+        def update(value: int) -> int:
+            return value * 2
+
+        self.assertEqual(stage1(4), 5)
+        self.assertEqual(update(4), 8)
+        metrics = profiler.summarize(
+            window_seconds=1.0,
+            updates=1,
+            global_batch_size=1,
+        )
+
+        self.assertIn("profile/stage1_duration_ms", metrics)
+        self.assertIn("profile/update_duration_ms", metrics)
+        self.assertNotIn("profile_gpu/stage1_sm_util_mean", metrics)
+
     def test_fine_profile_enabled_writes_rank_trace(self) -> None:
         calls: list[int] = []
         with TemporaryDirectory() as directory:

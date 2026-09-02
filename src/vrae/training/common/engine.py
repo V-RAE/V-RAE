@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import types
 import random
 import time
 from collections.abc import Mapping
@@ -820,6 +821,7 @@ def train_class_conditional(
     runtime = config.get("runtime", {})
     checkpoint_runtime = runtime.get("checkpoint", {})
     host_memory_runtime = runtime.get("host_memory", {})
+    profile_runtime = runtime.get("profile", {})
     checkpoint_drop_page_cache = bool(checkpoint_runtime.get("drop_page_cache", False))
     log_host_memory = bool(host_memory_runtime.get("log", False))
     min_host_available_gb = float(host_memory_runtime.get("min_available_gb", 0.0))
@@ -830,7 +832,101 @@ def train_class_conditional(
     last_saved_step = step
     stop = False
     memory_guard_message: str | None = None
-    profiler = TrainingProfiler(context.device)
+    profiler = TrainingProfiler(
+        context.device,
+        gpu_util_enabled=profile_runtime.get("gpu_util") if isinstance(profile_runtime, Mapping) else None,
+        gpu_util_interval_seconds=(
+            float(profile_runtime.get("gpu_util_interval_seconds", 0.2))
+            if isinstance(profile_runtime, Mapping)
+            else 0.2
+        ),
+        synchronize_phases=(
+            bool(profile_runtime.get("synchronize_phases", False))
+            if isinstance(profile_runtime, Mapping)
+            else False
+        ),
+    )
+
+    # Register semantic DIT phases.  The wrappers preserve the model API while
+    # allowing the sampler to attribute samples to prepare/core/post and the
+    # encoder/decoder block aggregates.
+    dit.prepare = profiler("dit.prepare", gpu_util=True)(dit.prepare)
+    dit.forward = profiler("dit.forward", gpu_util=True)(dit.forward)
+    dit._forward_core = profiler("dit.forward_core", gpu_util=True)(dit._forward_core)
+    dit.post = profiler("dit.post", gpu_util=True)(dit.post)
+    original_block = dit._run_conditioned_block
+    encoder_block = profiler("dit.encoder", gpu_util=True)(original_block)
+    decoder_block = profiler("dit.decoder", gpu_util=True)(original_block)
+
+    def profiled_block(self, block, value, condition, positions, rope_cache):
+        if any(block is item for item in self.encoder_blocks):
+            return encoder_block(block, value, condition, positions, rope_cache)
+        return decoder_block(block, value, condition, positions, rope_cache)
+
+    dit._run_conditioned_block = types.MethodType(profiled_block, dit)
+    profiled_backward = profiler("dit.backward", gpu_util=True)(accumulation.backward)
+
+    # Aggregate timings/utilization for the main submodules used by every
+    # encoder and decoder block.  The original module forwards are preserved.
+    def register_block_submodules(blocks, prefix: str) -> None:
+        for block in blocks:
+            for name in ("adaln_modulation", "norm1", "norm2", "attn", "mlp"):
+                module = getattr(block, name, None)
+                if module is None:
+                    continue
+                phase = profiler(
+                    f"dit.{prefix}.{name}",
+                    gpu_util=True,
+                    synchronize=False,
+                )
+                module.forward = phase(module.forward)
+
+    register_block_submodules(dit.encoder_blocks, "encoder")
+    register_block_submodules(dit.decoder_blocks, "decoder")
+
+    @profiler("stage1", gpu_util=True)
+    def run_stage1(flat_video: torch.Tensor, *, multiview: bool, views: int):
+        with torch.no_grad():
+            flat_grid = stage1.encode_grid(flat_video)
+            flat_tokens = stage1.grid_to_tokens(flat_grid)
+            if multiview:
+                batch_size, _, tokens, channels = flat_tokens.shape
+                clean = flat_tokens.reshape(
+                    batch_size // views,
+                    views,
+                    flat_tokens.shape[1],
+                    tokens,
+                    channels,
+                ).permute(0, 2, 1, 3, 4).contiguous()
+            else:
+                clean = flat_tokens
+            return normalizer.normalize(clean)
+
+    @profiler("dit", gpu_util=True)
+    def run_dit(
+        clean: torch.Tensor,
+        labels: torch.Tensor,
+        stream_ids: torch.Tensor | None,
+    ):
+        with accumulation.sync_context(model):
+            with precision.autocast():
+                losses = transport.training_losses(
+                    model,
+                    clean,
+                    model_kwargs={
+                        "labels": labels,
+                        **(
+                            {"stream_ids": stream_ids}
+                            if stream_ids is not None
+                            else {}
+                        ),
+                    },
+                )
+                loss = losses["loss"]
+            profiled_backward(loss, scaler)
+        return losses, loss
+
+    profiler.start()
     training_started_at = time.perf_counter()
     throughput_window_started_at = time.perf_counter()
     throughput_window_updates = 0
@@ -868,38 +964,9 @@ def train_class_conditional(
             else:
                 stream_ids = None
             profiler.finish_h2d()
-            with torch.no_grad():
-                flat_grid = stage1.encode_grid(flat_video)
-                flat_tokens = stage1.grid_to_tokens(flat_grid)
-                if multiview:
-                    batch_size, _, tokens, channels = flat_tokens.shape
-                    clean = flat_tokens.reshape(
-                        batch_size // views,
-                        views,
-                        flat_tokens.shape[1],
-                        tokens,
-                        channels,
-                    ).permute(0, 2, 1, 3, 4).contiguous()
-                else:
-                    clean = flat_tokens
-                clean = normalizer.normalize(clean)
+            clean = run_stage1(flat_video, multiview=multiview, views=views)
             profiler.finish_stage1()
-            with accumulation.sync_context(model):
-                with precision.autocast():
-                    losses = transport.training_losses(
-                        model,
-                        clean,
-                        model_kwargs={
-                            "labels": labels,
-                            **(
-                                {"stream_ids": stream_ids}
-                                if stream_ids is not None
-                                else {}
-                            ),
-                        },
-                    )
-                    loss = losses["loss"]
-                accumulation.backward(loss, scaler)
+            losses, loss = run_dit(clean, labels, stream_ids)
             profiler.finish_backward()
             sampler.commit_batch()
             if not accumulation.advance():
@@ -986,16 +1053,6 @@ def train_class_conditional(
                     f"allocated={profile_metrics['profile/allocated_gb']:.1f}GiB "
                     f"reserved={profile_metrics['profile/reserved_gb']:.1f}GiB "
                     f"peak={profile_metrics['profile/max_allocated_gb']:.1f}GiB",
-                    flush=True,
-                )
-                print(
-                    "[memory-phases] allocated="
-                    f"{profile_metrics['profile/batch_start_allocated_gb_mean']:.1f}/"
-                    f"{profile_metrics['profile/after_h2d_allocated_gb_mean']:.1f}/"
-                    f"{profile_metrics['profile/after_stage1_allocated_gb_mean']:.1f}/"
-                    f"{profile_metrics['profile/after_backward_allocated_gb_mean']:.1f}/"
-                    f"{profile_metrics['profile/after_update_allocated_gb_mean']:.1f}GiB "
-                    "(batch_start/h2d/stage1/backward/update)",
                     flush=True,
                 )
                 logger.log(
@@ -1207,6 +1264,7 @@ def train_class_conditional(
     close_loader = getattr(loader, "close", None)
     if callable(close_loader):
         close_loader()
+    profiler.stop()
     logger.finish()
     if context.is_main:
         print(

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from collections import defaultdict
+import functools
+import os
+import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -11,18 +14,161 @@ import torch
 class TrainingProfiler:
     """Collect training-stage latency and CUDA-memory measurements per log window."""
 
-    _MEMORY_PHASES = (
-        "batch_start",
-        "after_h2d",
-        "after_stage1",
-        "after_backward",
-        "after_update",
-    )
-
-    def __init__(self, device: torch.device) -> None:
+    def __init__(
+        self,
+        device: torch.device,
+        *,
+        gpu_util_enabled: bool | None = None,
+        gpu_util_interval_seconds: float = 0.2,
+        synchronize_phases: bool = False,
+    ) -> None:
         self.device = device
         self.cuda_enabled = device.type == "cuda"
+        self.gpu_util_enabled = (
+            os.environ.get("VRAE_GPU_UTIL_PROFILE", "0").lower()
+            in {"1", "true", "yes", "on"}
+            if gpu_util_enabled is None
+            else bool(gpu_util_enabled)
+        )
+        if gpu_util_interval_seconds <= 0:
+            raise ValueError("gpu_util_interval_seconds must be positive")
+        self.gpu_util_interval_seconds = float(gpu_util_interval_seconds)
+        self.synchronize_phases = bool(synchronize_phases)
+        self._phase_specs: dict[str, bool] = {}
+        self._phase_lock = threading.Lock()
+        self._active_phase: str | None = None
+        self._gpu_sampler_thread: threading.Thread | None = None
+        self._gpu_sampler_running = False
+        self._nvml = None
+        self._nvml_handle = None
         self.reset()
+
+    def __call__(
+        self,
+        phase: str,
+        *,
+        gpu_util: bool = False,
+        synchronize: bool | None = None,
+    ):
+        """Register a phase and return a decorator that measures its duration."""
+
+        phase_name = str(phase).strip()
+        if not phase_name:
+            raise ValueError("Profiler phase name must be non-empty")
+        collect_gpu_util = bool(gpu_util)
+        synchronize_phase = (
+            self.synchronize_phases if synchronize is None else bool(synchronize)
+        )
+        registered = self._phase_specs.get(phase_name)
+        if registered is not None and registered != collect_gpu_util:
+            raise ValueError(
+                f"Profiler phase {phase_name!r} was registered with a different gpu_util setting"
+            )
+        self._phase_specs[phase_name] = collect_gpu_util
+        self._phase_duration_seconds.setdefault(phase_name, 0.0)
+        self._phase_duration_count.setdefault(phase_name, 0)
+        self._phase_gpu_sm_sum.setdefault(phase_name, 0.0)
+        self._phase_gpu_memory_sum.setdefault(phase_name, 0.0)
+        self._phase_gpu_sample_count.setdefault(phase_name, 0)
+        self._phase_allocated_gb_sum.setdefault(phase_name, 0.0)
+        self._phase_allocated_gb_max.setdefault(phase_name, 0.0)
+        self._phase_reserved_gb_sum.setdefault(phase_name, 0.0)
+        self._phase_reserved_gb_max.setdefault(phase_name, 0.0)
+
+        def decorate(function):
+            @functools.wraps(function)
+            def wrapped(*args, **kwargs):
+                if synchronize_phase and self.cuda_enabled:
+                    torch.cuda.synchronize(self.device)
+                started_at = time.perf_counter()
+                with self._phase_lock:
+                    previous_phase = self._active_phase
+                    self._active_phase = phase_name
+                try:
+                    return function(*args, **kwargs)
+                finally:
+                    if synchronize_phase and self.cuda_enabled:
+                        torch.cuda.synchronize(self.device)
+                    elapsed = time.perf_counter() - started_at
+                    with self._phase_lock:
+                        self._phase_duration_seconds[phase_name] += elapsed
+                        self._phase_duration_count[phase_name] += 1
+                        if self.cuda_enabled:
+                            allocated = torch.cuda.memory_allocated(self.device) / float(1024**3)
+                            reserved = torch.cuda.memory_reserved(self.device) / float(1024**3)
+                            self._phase_allocated_gb_sum[phase_name] += allocated
+                            self._phase_allocated_gb_max[phase_name] = max(
+                                self._phase_allocated_gb_max[phase_name],
+                                allocated,
+                            )
+                            self._phase_reserved_gb_sum[phase_name] += reserved
+                            self._phase_reserved_gb_max[phase_name] = max(
+                                self._phase_reserved_gb_max[phase_name],
+                                reserved,
+                            )
+                        self._active_phase = previous_phase
+
+            return wrapped
+
+        return decorate
+
+    def start(self) -> None:
+        """Start optional NVML sampling for phases registered with gpu_util=True."""
+
+        if not self.cuda_enabled or not self.gpu_util_enabled:
+            return
+        if self._gpu_sampler_running:
+            return
+        gpu_phases = [name for name, enabled in self._phase_specs.items() if enabled]
+        if not gpu_phases:
+            return
+        try:
+            import pynvml
+        except ImportError as error:
+            raise RuntimeError(
+                "GPU utilization profiling requires the pynvml package"
+            ) from error
+        pynvml.nvmlInit()
+        self._nvml = pynvml
+        self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(
+            self.device.index or 0
+        )
+        self._gpu_sampler_running = True
+        self._gpu_sampler_thread = threading.Thread(
+            target=self._sample_gpu_utilization,
+            name="vrae-gpu-util-profiler",
+            daemon=True,
+        )
+        self._gpu_sampler_thread.start()
+
+    def stop(self) -> None:
+        """Stop optional NVML sampling and release its handle."""
+
+        if not self._gpu_sampler_running:
+            return
+        self._gpu_sampler_running = False
+        if self._gpu_sampler_thread is not None:
+            self._gpu_sampler_thread.join(timeout=1.0)
+        if self._nvml is not None:
+            self._nvml.nvmlShutdown()
+        self._gpu_sampler_thread = None
+        self._nvml = None
+        self._nvml_handle = None
+
+    def _sample_gpu_utilization(self) -> None:
+        while self._gpu_sampler_running:
+            with self._phase_lock:
+                phase = self._active_phase
+                collect_gpu_util = bool(self._phase_specs.get(phase, False))
+            if phase is not None and collect_gpu_util:
+                utilization = self._nvml.nvmlDeviceGetUtilizationRates(
+                    self._nvml_handle
+                )
+                with self._phase_lock:
+                    self._phase_gpu_sm_sum[phase] += float(utilization.gpu)
+                    self._phase_gpu_memory_sum[phase] += float(utilization.memory)
+                    self._phase_gpu_sample_count[phase] += 1
+            time.sleep(self.gpu_util_interval_seconds)
 
     def reset(self) -> None:
         self.data_wait_seconds = 0.0
@@ -32,24 +178,31 @@ class TrainingProfiler:
         self._update_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self._current_events: tuple[torch.cuda.Event, ...] | None = None
         self._last_backward_event: torch.cuda.Event | None = None
-        self._allocated_gb: dict[str, list[float]] = defaultdict(list)
-        self._reserved_gb: dict[str, list[float]] = defaultdict(list)
+        self._phase_duration_seconds: dict[str, float] = {}
+        self._phase_duration_count: dict[str, int] = {}
+        self._phase_gpu_sm_sum: dict[str, float] = {}
+        self._phase_gpu_memory_sum: dict[str, float] = {}
+        self._phase_gpu_sample_count: dict[str, int] = {}
+        self._phase_allocated_gb_sum: dict[str, float] = {}
+        self._phase_allocated_gb_max: dict[str, float] = {}
+        self._phase_reserved_gb_sum: dict[str, float] = {}
+        self._phase_reserved_gb_max: dict[str, float] = {}
+        with self._phase_lock:
+            for phase in self._phase_specs:
+                self._phase_duration_seconds[phase] = 0.0
+                self._phase_duration_count[phase] = 0
+                self._phase_gpu_sm_sum[phase] = 0.0
+                self._phase_gpu_memory_sum[phase] = 0.0
+                self._phase_gpu_sample_count[phase] = 0
+                self._phase_allocated_gb_sum[phase] = 0.0
+                self._phase_allocated_gb_max[phase] = 0.0
+                self._phase_reserved_gb_sum[phase] = 0.0
+                self._phase_reserved_gb_max[phase] = 0.0
 
     def record_data_wait(self, seconds: float) -> None:
         self.data_wait_seconds += float(seconds)
         self.data_wait_max_seconds = max(self.data_wait_max_seconds, float(seconds))
         self.data_wait_batches += 1
-
-    def _record_memory(self, phase: str) -> None:
-        if not self.cuda_enabled:
-            return
-        gib = float(1024**3)
-        self._allocated_gb[phase].append(
-            torch.cuda.memory_allocated(self.device) / gib
-        )
-        self._reserved_gb[phase].append(
-            torch.cuda.memory_reserved(self.device) / gib
-        )
 
     def begin_batch(self) -> None:
         if self.cuda_enabled:
@@ -57,17 +210,14 @@ class TrainingProfiler:
                 torch.cuda.Event(enable_timing=True) for _ in range(4)
             )
             self._current_events[0].record()
-        self._record_memory("batch_start")
 
     def finish_h2d(self) -> None:
         if self._current_events is not None:
             self._current_events[1].record()
-        self._record_memory("after_h2d")
 
     def finish_stage1(self) -> None:
         if self._current_events is not None:
             self._current_events[2].record()
-        self._record_memory("after_stage1")
 
     def finish_backward(self) -> None:
         if self._current_events is not None:
@@ -75,7 +225,6 @@ class TrainingProfiler:
             self._batch_events.append(self._current_events)
             self._last_backward_event = self._current_events[3]
             self._current_events = None
-        self._record_memory("after_backward")
 
     def finish_update(self) -> None:
         if self._last_backward_event is not None:
@@ -83,7 +232,6 @@ class TrainingProfiler:
             finished.record()
             self._update_events.append((self._last_backward_event, finished))
             self._last_backward_event = None
-        self._record_memory("after_update")
 
     def summarize(
         self,
@@ -113,22 +261,7 @@ class TrainingProfiler:
             float(len(self._batch_events)),
             float(len(self._update_events)),
         ]
-        for phase in self._MEMORY_PHASES:
-            sums.extend(
-                (
-                    sum(self._allocated_gb[phase]),
-                    sum(self._reserved_gb[phase]),
-                    float(len(self._allocated_gb[phase])),
-                )
-            )
         maxima = [self.data_wait_max_seconds, float(window_seconds)]
-        for phase in self._MEMORY_PHASES:
-            maxima.extend(
-                (
-                    max(self._allocated_gb[phase], default=0.0),
-                    max(self._reserved_gb[phase], default=0.0),
-                )
-            )
         if self.cuda_enabled:
             maxima.extend(
                 (
@@ -172,25 +305,38 @@ class TrainingProfiler:
             "profile/reserved_gb": float(max_tensor[-2].item()),
             "profile/max_allocated_gb": float(max_tensor[-1].item()),
         }
-        sum_offset = 8
-        max_offset = 2
-        for phase in self._MEMORY_PHASES:
-            allocated_sum, reserved_sum, count = sum_tensor[sum_offset : sum_offset + 3]
-            divisor = max(float(count.item()), 1.0)
-            metrics[f"profile/{phase}_allocated_gb_mean"] = float(
-                allocated_sum.item() / divisor
-            )
-            metrics[f"profile/{phase}_reserved_gb_mean"] = float(
-                reserved_sum.item() / divisor
-            )
-            metrics[f"profile/{phase}_allocated_gb_max"] = float(
-                max_tensor[max_offset].item()
-            )
-            metrics[f"profile/{phase}_reserved_gb_max"] = float(
-                max_tensor[max_offset + 1].item()
-            )
-            sum_offset += 3
-            max_offset += 2
+        with self._phase_lock:
+            for phase, collect_gpu_util in self._phase_specs.items():
+                duration_count = self._phase_duration_count[phase]
+                if duration_count:
+                    metrics[f"profile/{phase}_duration_ms"] = (
+                        self._phase_duration_seconds[phase]
+                        / duration_count
+                        * 1000.0
+                    )
+                    metrics[f"profile/{phase}_duration_count"] = float(duration_count)
+                    metrics[f"profile_memory/{phase}_allocated_gb_mean"] = (
+                        self._phase_allocated_gb_sum[phase] / duration_count
+                    )
+                    metrics[f"profile_memory/{phase}_allocated_gb_max"] = (
+                        self._phase_allocated_gb_max[phase]
+                    )
+                    metrics[f"profile_memory/{phase}_reserved_gb_mean"] = (
+                        self._phase_reserved_gb_sum[phase] / duration_count
+                    )
+                    metrics[f"profile_memory/{phase}_reserved_gb_max"] = (
+                        self._phase_reserved_gb_max[phase]
+                    )
+                if collect_gpu_util:
+                    sample_count = self._phase_gpu_sample_count[phase]
+                    if sample_count:
+                        metrics[f"profile_gpu/{phase}_sm_util_mean"] = (
+                            self._phase_gpu_sm_sum[phase] / sample_count
+                        )
+                        metrics[f"profile_gpu/{phase}_memory_util_mean"] = (
+                            self._phase_gpu_memory_sum[phase] / sample_count
+                        )
+                        metrics[f"profile_gpu/{phase}_sample_count"] = float(sample_count)
         return metrics
 
 

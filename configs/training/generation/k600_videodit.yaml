@@ -1,0 +1,50 @@
+include:
+  - ../../models/vrae_vjepa2_1_l_k7.yaml
+  - ../../models/dit_class_cond.yaml
+
+task: k600_videogen
+run_name: k600_videodit
+model:
+  decoder:
+    attention_mode: full
+  multiview:
+    enabled: false
+
+stage1:
+  # The downloaded stats record this training checkpoint path; the local path
+  # is a symlink to the requested pretrained V-RAE weights.
+  checkpoint: ckpts/recon_training/vjepa2_1_vrae_training_2/checkpoints/step-00149000.pt
+  weights: ema
+  precision: bf16
+
+latent_normalizer:
+  path: ckpts/k600_videogen/latent_stats/vjepa2_1_k600_20f_step00149000_ema_full_bf16.pt
+
+dit:
+  num_classes: 600
+  attention_backend: auto
+  gradient_checkpointing: false
+
+transport:
+  prediction: x
+  time_dist_type: logit-normal_0_1
+  time_dist_shift: 17.88854381999832
+  t_eps: 0.05
+  base_model_coeff: 1.0
+
+data:
+  dataset: k600
+  split: train
+  num_frames: 20
+  frame_interval: 3
+  image_size: 256
+  fps: 8
+
+sampling:
+  base_seed: 3407
+  steps: 100
+  cfg_scale: 1.0
+  internal_guidance_scale: 1.78
+  internal_guidance_t_min: 0.10
+  internal_guidance_t_max: 1.0
+  class_ids: [0, 1, 2, 3]

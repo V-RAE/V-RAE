@@ -8,7 +8,7 @@ model:
   decoder:
     attention_mode: full
 stage1:
-  checkpoint: ckpts/recon_training/vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained/checkpoints/latest.pt
+  checkpoint: ckpts/pretrained/vrae/vrae_vjepa2.1.pt
   weights: ema
   precision: bf16
 latent_normalizer:
@@ -16,18 +16,18 @@ latent_normalizer:
 dit:
   num_classes: 40
   attention_backend: auto
-  gradient_checkpointing: true
+  gradient_checkpointing: false
 transport:
   prediction: x
   time_dist_type: logit-normal_0_1
-  time_dist_shift: 22.627416997969522
+  time_dist_shift: 17.88854381999832
   t_eps: 0.05
   base_model_coeff: 1.0
 training:
   resume: null
   init_from: null
-  global_batch_size: 32
-  gradient_accumulation_steps: 1
+  global_batch_size: 16
+  gradient_accumulation_steps: 2
   clip_grad: 1.0
   epochs: 3000
   checkpoint_interval: 1000

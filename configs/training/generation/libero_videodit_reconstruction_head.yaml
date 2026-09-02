@@ -13,20 +13,23 @@ data:
   view_key: observation.images.image
   camera_keys:
     - {key: observation.images.image, name: head, stream_id: 0}
-  num_frames: 16
+  num_frames: 20
   frame_interval: 3
   random_frame_interval: false
   frame_interval_min: 1
   frame_interval_max: 4
 latent_normalizer:
   path: ckpts/libero_videogen/latent_stats/vjepa2_1_libero_videodit_reconstruction_head.pt
-transport:
-  time_dist_shift: 16.0
 training:
   resume: null
   init_from: null
-  global_batch_size: 42
-  gradient_accumulation_steps: 3
+  global_batch_size: 16
+  gradient_accumulation_steps: 2
+runtime:
+  profile:
+    gpu_util: true
+    gpu_util_interval_seconds: 0.02
+    synchronize_phases: true
 wandb:
   group: libero_videogen_reconstruction_head
   tags: [libero, reconstruction, head, single_view, vjepa2_1]
