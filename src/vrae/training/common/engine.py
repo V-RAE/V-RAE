@@ -268,6 +268,7 @@ class ClassConditionalVideoDataset:
                 manifest_path,
                 repo_id=str(data.get("repo_id", "libero")),
                 num_frames=int(data["num_frames"]),
+                view_key=(str(data["view_key"]) if data.get("view_key") else None),
                 frame_interval=int(data.get("frame_interval", 3)),
                 random_frame_interval=bool(data.get("random_frame_interval", False)),
                 frame_interval_min=int(data.get("frame_interval_min", 1)),
@@ -940,7 +941,7 @@ def train_class_conditional(
                     if log_host_memory or min_host_available_gb > 0.0
                     else {}
                 )
-                updates_per_second = profile_metrics["train/updates_per_second"]
+                updates_per_second = profile_metrics["profile/updates_per_second"]
                 ms_per_step = 1000.0 / updates_per_second
                 min_available_gb = host_metrics.get("memory/host_available_min_gb")
                 memory_guard_triggered = (
@@ -975,25 +976,25 @@ def train_class_conditional(
                 )
                 print(
                     "[profile] "
-                    f"window={profile_metrics['train/window_elapsed_sec']:.2f}s "
-                    f"updates={int(profile_metrics['train/window_updates'])} "
-                    f"data_wait={profile_metrics['train/data_wait_ms_mean']:.1f}ms "
-                    f"h2d={profile_metrics['train/h2d_ms']:.1f}ms "
-                    f"stage1={profile_metrics['train/stage1_ms']:.1f}ms "
-                    f"dit={profile_metrics['train/dit_ms']:.1f}ms "
-                    f"update={profile_metrics['train/update_ms']:.1f}ms "
-                    f"allocated={profile_metrics['memory/allocated_gb']:.1f}GiB "
-                    f"reserved={profile_metrics['memory/reserved_gb']:.1f}GiB "
-                    f"peak={profile_metrics['memory/max_allocated_gb']:.1f}GiB",
+                    f"window={profile_metrics['profile/window_elapsed_sec']:.2f}s "
+                    f"updates={int(profile_metrics['profile/window_updates'])} "
+                    f"data_wait={profile_metrics['profile/data_wait_ms_mean']:.1f}ms "
+                    f"h2d={profile_metrics['profile/h2d_ms']:.1f}ms "
+                    f"stage1={profile_metrics['profile/stage1_ms']:.1f}ms "
+                    f"dit={profile_metrics['profile/dit_ms']:.1f}ms "
+                    f"update={profile_metrics['profile/update_ms']:.1f}ms "
+                    f"allocated={profile_metrics['profile/allocated_gb']:.1f}GiB "
+                    f"reserved={profile_metrics['profile/reserved_gb']:.1f}GiB "
+                    f"peak={profile_metrics['profile/max_allocated_gb']:.1f}GiB",
                     flush=True,
                 )
                 print(
                     "[memory-phases] allocated="
-                    f"{profile_metrics['memory/batch_start_allocated_gb_mean']:.1f}/"
-                    f"{profile_metrics['memory/after_h2d_allocated_gb_mean']:.1f}/"
-                    f"{profile_metrics['memory/after_stage1_allocated_gb_mean']:.1f}/"
-                    f"{profile_metrics['memory/after_backward_allocated_gb_mean']:.1f}/"
-                    f"{profile_metrics['memory/after_update_allocated_gb_mean']:.1f}GiB "
+                    f"{profile_metrics['profile/batch_start_allocated_gb_mean']:.1f}/"
+                    f"{profile_metrics['profile/after_h2d_allocated_gb_mean']:.1f}/"
+                    f"{profile_metrics['profile/after_stage1_allocated_gb_mean']:.1f}/"
+                    f"{profile_metrics['profile/after_backward_allocated_gb_mean']:.1f}/"
+                    f"{profile_metrics['profile/after_update_allocated_gb_mean']:.1f}GiB "
                     "(batch_start/h2d/stage1/backward/update)",
                     flush=True,
                 )

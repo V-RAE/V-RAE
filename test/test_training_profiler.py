@@ -24,10 +24,10 @@ class TrainingProfilerTest(TestCase):
             global_batch_size=8,
         )
 
-        self.assertAlmostEqual(metrics["train/data_wait_ms_mean"], 20.0)
-        self.assertAlmostEqual(metrics["train/data_wait_ms_max"], 30.0)
-        self.assertAlmostEqual(metrics["train/updates_per_second"], 2.0)
-        self.assertAlmostEqual(metrics["train/samples_per_second"], 16.0)
+        self.assertAlmostEqual(metrics["profile/data_wait_ms_mean"], 20.0)
+        self.assertAlmostEqual(metrics["profile/data_wait_ms_max"], 30.0)
+        self.assertAlmostEqual(metrics["profile/updates_per_second"], 2.0)
+        self.assertAlmostEqual(metrics["profile/samples_per_second"], 16.0)
 
     def test_fine_profile_disabled_runs_callback_without_trace(self) -> None:
         calls: list[int] = []

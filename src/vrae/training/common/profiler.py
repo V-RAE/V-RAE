@@ -153,40 +153,40 @@ class TrainingProfiler:
         elapsed = max(float(max_tensor[1].item()), 1.0e-9)
         updates_per_second = int(updates) / elapsed
         metrics = {
-            "train/window_elapsed_sec": elapsed,
-            "train/window_updates": float(updates),
-            "train/profiled_batches": float(sum_tensor[6].item()),
-            "train/data_wait_ms_mean": float(
+            "profile/window_elapsed_sec": elapsed,
+            "profile/window_updates": float(updates),
+            "profile/profiled_batches": float(sum_tensor[6].item()),
+            "profile/data_wait_ms_mean": float(
                 wait_seconds.item()
                 / wait_batches.clamp_min(1).item()
                 * 1000.0
             ),
-            "train/data_wait_ms_max": float(max_tensor[0].item() * 1000.0),
-            "train/h2d_ms": float(h2d_sum.item() / batch_count),
-            "train/stage1_ms": float(stage1_sum.item() / batch_count),
-            "train/dit_ms": float(dit_sum.item() / batch_count),
-            "train/update_ms": float(update_sum.item() / update_count),
-            "train/updates_per_second": updates_per_second,
-            "train/samples_per_second": updates_per_second * int(global_batch_size),
-            "memory/allocated_gb": float(max_tensor[-3].item()),
-            "memory/reserved_gb": float(max_tensor[-2].item()),
-            "memory/max_allocated_gb": float(max_tensor[-1].item()),
+            "profile/data_wait_ms_max": float(max_tensor[0].item() * 1000.0),
+            "profile/h2d_ms": float(h2d_sum.item() / batch_count),
+            "profile/stage1_ms": float(stage1_sum.item() / batch_count),
+            "profile/dit_ms": float(dit_sum.item() / batch_count),
+            "profile/update_ms": float(update_sum.item() / update_count),
+            "profile/updates_per_second": updates_per_second,
+            "profile/samples_per_second": updates_per_second * int(global_batch_size),
+            "profile/allocated_gb": float(max_tensor[-3].item()),
+            "profile/reserved_gb": float(max_tensor[-2].item()),
+            "profile/max_allocated_gb": float(max_tensor[-1].item()),
         }
         sum_offset = 8
         max_offset = 2
         for phase in self._MEMORY_PHASES:
             allocated_sum, reserved_sum, count = sum_tensor[sum_offset : sum_offset + 3]
             divisor = max(float(count.item()), 1.0)
-            metrics[f"memory/{phase}_allocated_gb_mean"] = float(
+            metrics[f"profile/{phase}_allocated_gb_mean"] = float(
                 allocated_sum.item() / divisor
             )
-            metrics[f"memory/{phase}_reserved_gb_mean"] = float(
+            metrics[f"profile/{phase}_reserved_gb_mean"] = float(
                 reserved_sum.item() / divisor
             )
-            metrics[f"memory/{phase}_allocated_gb_max"] = float(
+            metrics[f"profile/{phase}_allocated_gb_max"] = float(
                 max_tensor[max_offset].item()
             )
-            metrics[f"memory/{phase}_reserved_gb_max"] = float(
+            metrics[f"profile/{phase}_reserved_gb_max"] = float(
                 max_tensor[max_offset + 1].item()
             )
             sum_offset += 3

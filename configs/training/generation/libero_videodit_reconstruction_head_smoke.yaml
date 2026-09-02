@@ -1,0 +1,9 @@
+include:
+  - libero_videodit_reconstruction_head.yaml
+
+run_name: vjepa2_1_libero_videodit_reconstruction_head_smoke
+training:
+  epochs: 1
+wandb:
+  mode: offline
+  sample_interval: 10

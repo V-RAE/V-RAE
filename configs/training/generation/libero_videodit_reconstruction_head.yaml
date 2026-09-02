@@ -1,0 +1,33 @@
+include:
+  - libero_videodit.yaml
+
+task: libero_videogen
+run_name: vjepa2_1_libero_videodit_reconstruction_head
+model:
+  multiview:
+    enabled: false
+    num_views: 1
+data:
+  dataset: reconstruction
+  manifest: data/metadata/libero_reconstruction.csv
+  view_key: observation.images.image
+  camera_keys:
+    - {key: observation.images.image, name: head, stream_id: 0}
+  num_frames: 16
+  frame_interval: 3
+  random_frame_interval: false
+  frame_interval_min: 1
+  frame_interval_max: 4
+latent_normalizer:
+  path: ckpts/libero_videogen/latent_stats/vjepa2_1_libero_videodit_reconstruction_head.pt
+transport:
+  time_dist_shift: 16.0
+training:
+  resume: null
+  init_from: null
+  global_batch_size: 42
+  gradient_accumulation_steps: 3
+wandb:
+  group: libero_videogen_reconstruction_head
+  tags: [libero, reconstruction, head, single_view, vjepa2_1]
+  sample_interval: 200

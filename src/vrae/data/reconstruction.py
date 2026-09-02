@@ -93,6 +93,7 @@ class ReconstructionDataset(LeRobotDataset):
         *,
         repo_id: str = "libero",
         num_frames: int = 16,
+        view_key: str | None = None,
         frame_interval: int = 3,
         random_frame_interval: bool = False,
         frame_interval_min: int = 1,
@@ -109,6 +110,15 @@ class ReconstructionDataset(LeRobotDataset):
             raise ValueError("frame interval bounds are invalid")
         super().__init__(repo_id, root=Path(root))
         self._manifest_episodes = load_libero_manifest(manifest)
+        if view_key is not None:
+            requested_view = str(view_key)
+            self._manifest_episodes = {
+                episode: tuple(view for view in views if view.view_key == requested_view)
+                for episode, views in self._manifest_episodes.items()
+            }
+            self._manifest_episodes = {
+                episode: views for episode, views in self._manifest_episodes.items() if views
+            }
         self.reconstruction_num_frames = int(num_frames)
         self.frame_interval = int(frame_interval)
         self.random_frame_interval = bool(random_frame_interval)
