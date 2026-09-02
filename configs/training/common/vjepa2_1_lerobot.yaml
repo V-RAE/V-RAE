@@ -1,6 +1,6 @@
 include:
-  - ../models/vrae_vjepa2_1_l_k7.yaml
-  - ../data/libero.yaml
+  - ../../models/vrae_vjepa2_1_l_k7.yaml
+  - ../../data/libero.yaml
 task: recon_training
 run_name: vjepa2_1_libero_reconstruction
 model:

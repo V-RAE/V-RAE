@@ -2,7 +2,7 @@ include:
   - libero_videodit.yaml
 
 task: libero_videogen
-run_name: vjepa2_1_libero_videodit_lerobot_pretrained
+run_name: vjepa2_1_libero_videodit_base
 stage1:
   checkpoint: ckpts/pretrained/vrae/vrae_vjepa2.1.pt
   weights: ema

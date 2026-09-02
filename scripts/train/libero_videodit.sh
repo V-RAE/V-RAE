@@ -24,7 +24,7 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd -- "${script_dir}/../.." && pwd)"
 export PYTHONPATH="${project_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
-config_path="${LIBERO_VIDEODIT_CONFIG:-${project_root}/configs/training/libero_videodit.yaml}"
+config_path="${LIBERO_VIDEODIT_CONFIG:-${project_root}/configs/training/generation/libero_videodit.yaml}"
 paths_file="${VRAE_PATHS_FILE:-${project_root}/configs/paths.local.yaml}"
 if [[ ! -f "${config_path}" ]]; then
   echo "VideoDiT config does not exist: ${config_path}" >&2

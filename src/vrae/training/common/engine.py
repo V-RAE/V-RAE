@@ -1288,14 +1288,20 @@ def generate_class_conditional(
         ig_scale=internal_guidance_scale,
         ig_intervals=((internal_guidance_t_min, internal_guidance_t_max),),
     )
-    clean_tokens = normalizer.denormalize(normalized)
-    clean_grid = stage1.tokens_to_grid(clean_tokens, height=grid_size[0], width=grid_size[1])
     if multiview:
-        batch, time, views, channels, height, width = clean_grid.shape
-        flat_grid = (
-            clean_grid.permute(0, 2, 1, 3, 4, 5)
-            .reshape(batch * views, time, channels, height, width)
+        # DiT keeps views explicit: [B,T,V,N,C]. The single-view V-RAE
+        # adapter expects [B*V,T,N,C], so fold views before token-to-grid.
+        batch, time, views, tokens, channels = normalized.shape
+        flat_tokens = (
+            normalized.permute(0, 2, 1, 3, 4)
+            .reshape(batch * views, time, tokens, channels)
             .contiguous()
+        )
+        flat_tokens = normalizer.denormalize(flat_tokens)
+        flat_grid = stage1.tokens_to_grid(
+            flat_tokens,
+            height=grid_size[0],
+            width=grid_size[1],
         )
         decoded = stage1.decode_grid(flat_grid)
         return decoded.reshape(
@@ -1306,4 +1312,10 @@ def generate_class_conditional(
             decoded.shape[3],
             decoded.shape[4],
         ).permute(0, 2, 1, 3, 4, 5).contiguous()
+    clean_tokens = normalizer.denormalize(normalized)
+    clean_grid = stage1.tokens_to_grid(
+        clean_tokens,
+        height=grid_size[0],
+        width=grid_size[1],
+    )
     return stage1.decode_grid(clean_grid)

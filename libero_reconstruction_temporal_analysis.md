@@ -60,7 +60,7 @@ loss:
   temporal_difference: 0.0
 ```
 
-配置位置：[`configs/training/vjepa2_1_lerobot.yaml:34`](/zsh/code/V-RAE/configs/training/vjepa2_1_lerobot.yaml:34)
+配置位置：[`configs/training/common/vjepa2_1_lerobot.yaml:34`](/zsh/code/V-RAE/configs/training/common/vjepa2_1_lerobot.yaml:34)
 
 当权重为 0 时，代码直接使用 `zero`，不会调用 `temporal_difference_loss`。因此日志恒为 0 是预期行为。
 
@@ -246,7 +246,7 @@ gan:
 - 重建 manifest 使用 CSV。脚本 [`src/vrae/data/create_reconstruction_manifest.py`](/zsh/code/V-RAE/src/vrae/data/create_reconstruction_manifest.py) 可从任意本地 LeRobot v3 根目录生成 manifest；支持 `view`/`camera_key`、`frame_count`/`length` 等字段别名，缺失长度时使用 episode metadata。
 - 每个 episode 每次只随机选择一个视角和一个 clip。固定模式默认 `interval=3`，完整窗口不足时过滤 episode，不做 padding；随机模式可在 `1..4` 中采样，越界时向更小 interval 回退。`set_epoch(epoch)` 会改变 temporal clip 和空间增强的随机序列。
 - 输出固定为单视角 `[B,T,C,H,W]`，空间处理为 resize short side、random crop、random flip。生成训练仍使用 [`src/vrae/data/lerobot.py`](/zsh/code/V-RAE/src/vrae/data/lerobot.py)，没有复用重建采样器。
-- `configs/training/vjepa2_1_lerobot.yaml` 已切换到 `lerobot_reconstruction` manifest 数据集，保留 `L1 + LPIPS + Gram`，`temporal_difference=0`，并在 epoch 30 启用 VideoMAE GAN。GAN 的 discriminator、optimizer、scheduler 和 loss state 一并写入 checkpoint，支持 resume。
+- `configs/training/common/vjepa2_1_lerobot.yaml` 已切换到 `lerobot_reconstruction` manifest 数据集，保留 `L1 + LPIPS + Gram`，`temporal_difference=0`，并在 epoch 30 启用 VideoMAE GAN。GAN 的 discriminator、optimizer、scheduler 和 loss state 一并写入 checkpoint，支持 resume。
 
 本地验证结果：重建 build-only、生成 build-only、`test/test_lerobot_dataset.py`（2 个测试）和一个真实 Libero manifest 采样 smoke test 均通过。生成的 `data/` 内容保持在 `.gitignore` 中，不提交数据文件。
 

@@ -46,7 +46,7 @@ VideoMAE GAN discriminator 权重也在该文档中，支持 OpenGVLab 的 Model
 
 ## Stage 1：LIBERO 重建训练
 
-配置：`configs/training/vjepa2_1_lerobot.yaml`。V-JEPA 2.1 始终冻结，只训练 temporal pool 和 V-RAE decoder。
+配置：`configs/training/reconstruction/vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained.yaml`。V-JEPA 2.1 始终冻结，只训练 temporal pool 和 V-RAE decoder。
 
 单机八卡启动：
 
@@ -86,7 +86,7 @@ scripts/eval/libero_rfvd.sh --max-samples 8 --output outputs/libero_rfvd/eval.js
 
 ## Stage 2：LIBERO VideoDiT 生成训练
 
-配置：`configs/training/libero_videodit.yaml`。它会读取 Stage 1 的 EMA 权重；latent mean/std 不存在时，会先从每个 episode 采样一个 clip，分布式计算通道统计量，然后开始 VideoDiT 训练。
+配置：`configs/training/generation/libero_videodit.yaml`。它会读取 Stage 1 的 EMA 权重；latent mean/std 不存在时，会先从每个 episode 采样一个 clip，分布式计算通道统计量，然后开始 VideoDiT 训练。
 
 单机八卡启动：
 
@@ -108,6 +108,23 @@ scripts/train/libero_videodit.sh 1 1 0 --build-only
 
 VideoDiT 只更新自身参数；V-JEPA、temporal pool 和 V-RAE decoder 全部冻结。定期采样会从噪声生成双视角 latent，再经冻结的 V-RAE decoder 还原视频。
 
+训练结束后可直接从正式配置对应 run 的 `checkpoints/latest.pt` 采样：
+
+```bash
+python sampling.py
+```
+
+也可以指定其他训练配置、类别和采样步数：
+
+```bash
+python sampling.py \
+  --config configs/training/generation/vjepa2_1_libero_videodit_high_util_fixed.yaml \
+  --checkpoint ckpts/libero_videogen/vjepa2_1_libero_videodit_high_util_fixed/checkpoints/latest.pt \
+  --labels 0,10,20,30 --num-samples 4 --steps 100
+```
+
+默认输出到 checkpoint run 的 `samples/`，包括 `samples.pt`、每个 sample/view 的 MP4 和 `sampling_metadata.json`。当前多视角输出张量为 `[B,T,V,C,H,W]`，每个视角单独写入一个视频。
+
 ## 目录
 
 ```text
@@ -116,6 +133,7 @@ src/vrae/data/                          LeRobot episode/clip 数据集
 src/vrae/training/recon_training/       Stage 1 重建训练
 src/vrae/training/libero_videogen/      Stage 2 LIBERO 生成入口
 configs/data/libero.yaml                数据、相机和 40 类映射
-configs/training/vjepa2_1_lerobot.yaml  重建配置
-configs/training/libero_videodit.yaml   生成配置
+configs/training/reconstruction/       重建训练配置
+configs/training/generation/           VideoDiT 生成训练配置
+configs/training/common/               重建/生成共用训练基础配置
 ```

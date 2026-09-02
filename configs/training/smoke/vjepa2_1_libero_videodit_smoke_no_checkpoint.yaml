@@ -1,6 +1,0 @@
-include:
-  - ../vjepa2_1_libero_videodit_lerobot_pretrained.yaml
-run_name: vjepa2_1_libero_videodit_smoke_no_checkpoint
-dit:
-  gradient_checkpointing: false
-

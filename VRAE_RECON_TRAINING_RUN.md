@@ -18,7 +18,7 @@
 配置文件：
 
 ```text
-configs/training/vjepa2_1_single_gpu_optimized.yaml
+configs/training/reconstruction/vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained.yaml
 ```
 
 启动命令：
@@ -28,7 +28,7 @@ cd /zsh/code/V-RAE
 env VJEPA_PYTHON=/zsh/miniconda3/envs/lerobotv3/bin/python \\
     VJEPA_TORCHRUN=/zsh/miniconda3/envs/lerobotv3/bin/torchrun \\
     scripts/train/vjepa2_1.sh 1 1 0 \\
-    --config configs/training/vjepa2_1_single_gpu_optimized.yaml \\
+    --config configs/training/reconstruction/vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained.yaml \\
     --max-steps 10000
 ```
 

@@ -1,6 +1,6 @@
 # VideoDiT Smoke 测试结果与正式方案
 
-所有测试均为单卡、20 steps、复用已有 latent statistics，`wandb.sample_interval` 均为 `1000`，没有修改该参数。短测试末尾的 checkpoint 时间单独列出，不计入稳态 step time。
+当前有效结果见 `configs/training/generation/smoke/RECORD.md`：所有 smoke 测试均为单卡、10 steps、global batch 32，并复用已有 latent statistics；`wandb.sample_interval` 保持 `1000`。本文件中的历史 batch36/40/48 结果不再作为当前方案。
 
 ## 结果
 
@@ -24,7 +24,7 @@
 
 ## 正式训练记录
 
-- 配置：`configs/training/vjepa2_1_libero_videodit_high_util.yaml`
+- 配置：`configs/training/generation/vjepa2_1_libero_videodit_high_util_fixed.yaml`
 - 初始化：`ckpts/pretrained/vrae/vrae_vjepa2.1.pt`，stage1 使用 EMA 权重
 - `global_batch_size: 48`，`dit.gradient_checkpointing: true`
 - `sample_interval: 1000`（保持不变）

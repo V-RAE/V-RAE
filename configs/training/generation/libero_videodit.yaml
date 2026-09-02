@@ -1,14 +1,14 @@
 include:
-  - ../models/vrae_vjepa2_1_l_k7.yaml
-  - ../models/dit_class_cond.yaml
-  - ../data/libero.yaml
+  - ../../models/vrae_vjepa2_1_l_k7.yaml
+  - ../../models/dit_class_cond.yaml
+  - ../../data/libero.yaml
 task: libero_videogen
 run_name: vjepa2_1_libero_videodit
 model:
   decoder:
     attention_mode: full
 stage1:
-  checkpoint: ckpts/recon_training/vjepa2_1_libero_reconstruction/checkpoints/latest.pt
+  checkpoint: ckpts/recon_training/vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained/checkpoints/latest.pt
   weights: ema
   precision: bf16
 latent_normalizer:

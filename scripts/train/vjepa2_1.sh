@@ -24,7 +24,7 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd -- "${script_dir}/../.." && pwd)"
 export PYTHONPATH="${project_root}/src${PYTHONPATH:+:${PYTHONPATH}}"
-config_path="${VJEPA_CONFIG:-${project_root}/configs/training/vjepa2_1_lerobot.yaml}"
+config_path="${VJEPA_CONFIG:-${project_root}/configs/training/reconstruction/vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained.yaml}"
 paths_file="${VRAE_PATHS_FILE:-${project_root}/configs/paths.local.yaml}"
 
 master_addr="${MASTER_ADDR:-127.0.0.1}"

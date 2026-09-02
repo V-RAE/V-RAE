@@ -7,8 +7,8 @@ from vrae.paths import ProjectPaths, find_project_root, load_project_paths
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RECONSTRUCTION_CONFIG = PROJECT_ROOT / "configs/training/vjepa2_1_lerobot.yaml"
-GENERATION_CONFIG = PROJECT_ROOT / "configs/training/libero_videodit.yaml"
+RECONSTRUCTION_CONFIG = PROJECT_ROOT / "configs/training/reconstruction/vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained.yaml"
+GENERATION_CONFIG = PROJECT_ROOT / "configs/training/generation/libero_videodit.yaml"
 
 
 def build_libero_paths(reconstruction: dict) -> ProjectPaths:
@@ -38,8 +38,19 @@ def main() -> None:
     if reconstruction_root != PROJECT_ROOT or generation_root != PROJECT_ROOT:
         raise RuntimeError("LIBERO training configs did not resolve to the repository root")
 
-    if reconstruction["data"] != generation["data"]:
-        raise RuntimeError("Reconstruction and generation must share the LIBERO data template")
+    shared_data_fields = (
+        "root",
+        "repo_id",
+        "split",
+        "camera_keys",
+        "num_frames",
+        "image_size",
+        "fps",
+        "seed",
+    )
+    for field in shared_data_fields:
+        if reconstruction["data"].get(field) != generation["data"].get(field):
+            raise RuntimeError(f"Reconstruction and generation disagree on data.{field}")
 
     paths = build_libero_paths(reconstruction)
     libero_dataset = paths.dataset("lerobot")

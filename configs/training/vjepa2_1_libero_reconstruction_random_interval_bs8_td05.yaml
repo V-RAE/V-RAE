@@ -1,8 +1,0 @@
-include:
-  - vjepa2_1_libero_reconstruction_random_interval_bs8.yaml
-
-run_name: vjepa2_1_libero_reconstruction_random_interval_bs8_td05
-training:
-  resume: null
-loss:
-  temporal_difference: 0.5

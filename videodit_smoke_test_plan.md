@@ -6,11 +6,11 @@
 
 ## 当前基线
 
-基线配置为 `configs/training/vjepa2_1_libero_videodit_lerobot_pretrained.yaml`：单卡、全局 batch 32、DiT gradient checkpointing 开启、8 个解码线程、bounded loader、异步预取 2 个 batch。已有日志 `/tmp/vrae_libero_videogen_lerobot_pretrained.log` 作为旧基线，不与新实验目录混用。
+详细执行计划与 10 步 smoke 记录统一放在 `configs/training/generation/smoke/PLAN.md` 和 `RECORD.md`。当前基线为 batch 32、DiT gradient checkpointing 开启；旧的 batch36/40/48 探索不再作为当前方案。
 
 ## 实验设计
 
-每个方案使用独立 `run_name`，复用已经生成的 latent statistics，使用 `--max-steps 20`，不触发 sample（因此不会改变或绕过 `sample_interval`）。每次记录：
+每个方案使用独立 `run_name`，复用已经生成的 latent statistics，使用 `--max-steps 10`，不触发 sample（因此不会改变或绕过 `sample_interval`）。每次记录：
 
 - step wall time、吞吐、data wait、H2D、stage1、DiT、optimizer/update 阶段时长；
 - allocated/reserved/peak 显存和各阶段显存；

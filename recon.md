@@ -1,7 +1,7 @@
 # V-JEPA 2.1 + LIBERO 重建训练：完整文件调用链
 
 本文只描述当前正在使用的单卡配置：
-configs/training/vjepa2_1_single_gpu_optimized.yaml。
+configs/training/reconstruction/vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained.yaml。
 
 ## 1. 启动脚本：scripts/train/vjepa2_1.sh
 
@@ -22,24 +22,31 @@ torchrun_bin="/zsh/miniconda3/envs/lerobotv3/bin/torchrun"
 torchrun --nnodes=1 --nproc_per_node=1 --node_rank=0 \
   --master_addr=127.0.0.1 --master_port=29500 \
   -m vrae.training.recon_training.train \
-  --config configs/training/vjepa2_1_single_gpu_optimized.yaml \
+  --config configs/training/reconstruction/vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained.yaml \
   --max-steps 10000
 ~~~
 
 脚本不做训练计算，只负责校验 rank/GPU 参数、设置 PYTHONPATH、选择 Python 3.12 lerobotv3 环境，并通过 torchrun 启动 vrae.training.recon_training.train。当前是单节点单进程，因此 WORLD_SIZE=1，不建立多卡 DDP 通信。
 
-## 2. 配置合并：configs/training/vjepa2_1_single_gpu_optimized.yaml
+## 2. 配置：configs/training/reconstruction/vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained.yaml
 
 ~~~yaml
 # 阶段 1/3：继承正式 V-JEPA 2.1 LIBERO 重建配置
 include:
   - vjepa2_1_lerobot.yaml
 
-# 阶段 2/3：覆盖当前单卡训练资源设置
-run_name: vjepa2_1_libero_reconstruction_single_gpu_bs4
+# 阶段 2/3：覆盖当前单卡随机 interval 与预训练初始化设置
+run_name: vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained
+data:
+  frame_interval: 4
+  random_frame_interval: true
+  frame_interval_min: 1
+  frame_interval_max: 4
 training:
-  init_from: ckpts/recon_training/vjepa2_1_libero_reconstruction_single_gpu_bs4/initialization/step-00001000.pt
-  global_batch_size: 4
+  init_from: ckpts/pretrained/vrae/vrae_vjepa2.1.pt
+  init_weights: ema
+  resume: null
+  global_batch_size: 8
   num_workers: 8
   pin_memory: true
   prefetch_factor: 4
@@ -47,12 +54,13 @@ training:
   prefetch_to_device: true
   checkpoint_interval: 1000
 
-# 阶段 3/3：当前不连接 WandB，但保留本地采样逻辑
+# 阶段 3/3：在线记录并保留本地采样逻辑
 wandb:
-  mode: disabled
+  mode: online
+  sample_interval: 2000
 ~~~
 
-当前配置从 step-1000 初始化权重开始，单卡每个 micro-batch 包含 4 个双视角样本；8 个 worker、pinned memory 和 CUDA 预取用于减少视频解码与 Host-to-Device 拷贝造成的 GPU 空档。include 的深度合并由 src/vrae/config.py 完成，当前文件中的值覆盖被包含文件中的同名字段。
+当前配置从 V-JEPA 2.1 预训练 EMA 权重开始，单卡每个 micro-batch 包含 8 个样本；视频 clip 使用随机 frame interval，8 个 worker、pinned memory 和 CUDA 预取用于减少视频解码与 Host-to-Device 拷贝造成的 GPU 空档。基础模型、数据和 loss 仍由 `vjepa2_1_lerobot.yaml` 及其 include 提供，当前文件中的值覆盖被包含文件中的同名字段。
 
 ## 3. 配置加载与路径：src/vrae/config.py、src/vrae/paths.py
 
@@ -149,10 +157,10 @@ registry 把字符串名称映射到模型工厂；VRAE.from_config 组合冻结
 ## 6. 配置文件的模型与数据来源
 
 ~~~yaml
-# configs/training/vjepa2_1_lerobot.yaml
+# configs/training/common/vjepa2_1_lerobot.yaml
 include:
-  - ../models/vrae_vjepa2_1_l_k7.yaml
-  - ../data/libero.yaml
+  - ../../models/vrae_vjepa2_1_l_k7.yaml
+  - ../../data/libero.yaml
 
 # configs/models/vrae_vjepa2_1_l_k7.yaml
 model:
@@ -435,9 +443,9 @@ if step % checkpoint_interval == 0:          # 当前为 1000
 scripts/train/vjepa2_1.sh
   单卡 torchrun 启动、环境变量和 rank 参数。
 
-configs/training/vjepa2_1_single_gpu_optimized.yaml
-  当前 batch=4、8 workers、预取、初始化 checkpoint 和 WandB 开关。
-configs/training/vjepa2_1_lerobot.yaml
+configs/training/reconstruction/vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained.yaml
+  当前 batch=8、随机 interval、8 workers、预取、初始化 checkpoint 和 WandB 开关。
+configs/training/common/vjepa2_1_lerobot.yaml
   Stage 1 重建任务、优化器、loss、epoch 和采样策略。
 configs/models/vrae_vjepa2_1_l_k7.yaml
   V-JEPA 2.1 encoder、K7 层融合和 temporal pool。
