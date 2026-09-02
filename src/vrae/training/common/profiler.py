@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -189,3 +192,56 @@ class TrainingProfiler:
             sum_offset += 3
             max_offset += 2
         return metrics
+
+
+def run_fine_profile(
+    train_one_step: Callable[[int], Any],
+    *,
+    steps: int,
+    enabled: bool = False,
+    rank: int = 0,
+    rank_filter: Sequence[int] = (0,),
+    output_dir: str | Path = "outputs/profile/fine",
+    wait_steps: int = 1,
+    warmup_steps: int = 1,
+    active_steps: int = 3,
+    repeat: int = 1,
+    record_shapes: bool = False,
+    profile_memory: bool = False,
+    with_stack: bool = False,
+    with_modules: bool = False,
+) -> None:
+    """Run a short torch.profiler window without changing normal training.
+
+    The callback owns one training step. Profiling is rank-filtered and disabled
+    by default so callers can keep this helper out of the steady-state path.
+    """
+
+    if not enabled or int(rank) not in {int(value) for value in rank_filter}:
+        for step in range(int(steps)):
+            train_one_step(step)
+        return
+
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    trace_dir = Path(output_dir) / f"rank{int(rank)}"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    with torch.profiler.profile(
+        activities=activities,
+        schedule=torch.profiler.schedule(
+            wait=int(wait_steps),
+            warmup=int(warmup_steps),
+            active=int(active_steps),
+            repeat=int(repeat),
+        ),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_dir)),
+        record_shapes=bool(record_shapes),
+        profile_memory=bool(profile_memory),
+        with_stack=bool(with_stack),
+        with_modules=bool(with_modules),
+    ) as profiler:
+        for step in range(int(steps)):
+            with torch.profiler.record_function("train.step"):
+                train_one_step(step)
+            profiler.step()

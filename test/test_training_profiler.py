@@ -2,7 +2,7 @@ from unittest import TestCase
 
 import torch
 
-from vrae.training.common.profiler import TrainingProfiler
+from vrae.training.common.profiler import TrainingProfiler, run_fine_profile
 
 
 class TrainingProfilerTest(TestCase):
@@ -26,3 +26,8 @@ class TrainingProfilerTest(TestCase):
         self.assertAlmostEqual(metrics["train/data_wait_ms_max"], 30.0)
         self.assertAlmostEqual(metrics["train/updates_per_second"], 2.0)
         self.assertAlmostEqual(metrics["train/samples_per_second"], 16.0)
+
+    def test_fine_profile_disabled_runs_callback_without_trace(self) -> None:
+        calls: list[int] = []
+        run_fine_profile(calls.append, steps=3)
+        self.assertEqual(calls, [0, 1, 2])

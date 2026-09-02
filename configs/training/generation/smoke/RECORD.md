@@ -43,3 +43,7 @@ python -m vrae.training.libero_videogen.train \
 | optimized（8 解码线程、32/4/2 队列） | 8.49s | 816.5ms | 20.1ms | 1.330s | 6.051s | 45.8GiB |
 
 两次运行 loss 均为 `2.572266`（step 10），无 OOM、NaN 或解码错误。10 步样本不足以证明吞吐提升；本机结果显示增加解码并发反而略慢，因此默认保留 bounded loader 的有限队列实现，但不继续扩大线程/队列。两次运行均生成了 step-00000010 checkpoint，路径在 `ckpts/libero_videogen/smoke/libero_videogen/` 下。
+
+## 第 2 阶段：细粒度 profiler API
+
+新增 `run_fine_profile`，支持 `wait/warmup/active/repeat`、rank 过滤、CUDA/CPU activity、trace 输出和开销较高选项（shape、memory、stack、modules）。默认 `enabled=False`；smoke 训练不打开 trace，避免把 profiler 时间混入吞吐比较。调用方只需传入单步 callback，trace 输出到指定目录的 `rank<N>` 子目录。
