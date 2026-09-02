@@ -1,4 +1,6 @@
 from unittest import TestCase
+from tempfile import TemporaryDirectory
+from pathlib import Path
 
 import torch
 
@@ -31,3 +33,20 @@ class TrainingProfilerTest(TestCase):
         calls: list[int] = []
         run_fine_profile(calls.append, steps=3)
         self.assertEqual(calls, [0, 1, 2])
+
+    def test_fine_profile_enabled_writes_rank_trace(self) -> None:
+        calls: list[int] = []
+        with TemporaryDirectory() as directory:
+            run_fine_profile(
+                calls.append,
+                steps=1,
+                enabled=True,
+                rank_filter=(0,),
+                output_dir=directory,
+                wait_steps=0,
+                warmup_steps=0,
+                active_steps=1,
+            )
+            trace_files = list(Path(directory, "rank0").glob("*.json"))
+        self.assertEqual(calls, [0])
+        self.assertTrue(trace_files)
