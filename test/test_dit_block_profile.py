@@ -58,6 +58,7 @@ class _NvmlSampler:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_single_encoder_block_gpu_profile() -> None:
     from vrae.models.dit.blocks import AdaLNZeroDDTBlock
+    from vrae.models.dit.rope import RoPE3D
 
     device = torch.device("cuda")
     block = AdaLNZeroDDTBlock(
@@ -68,7 +69,7 @@ def test_single_encoder_block_gpu_profile() -> None:
     ).to(device).eval()
     value = torch.randn(8, 1280, 1536, device=device, dtype=torch.bfloat16)
     condition = torch.randn(8, 1536, device=device, dtype=torch.bfloat16)
-    positions = torch.zeros(1280, 3, device=device, dtype=torch.long)
+    freqs = RoPE3D(64, end=16)(5, 16, 16).to(device=device)
 
     sampler = _NvmlSampler()
     timings: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = defaultdict(list)
@@ -103,13 +104,13 @@ def test_single_encoder_block_gpu_profile() -> None:
         )
 
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        block(value, condition, positions)
+        block(value, condition, freqs)
     torch.cuda.synchronize(device)
     sampler.start()
     repetitions = 100
     for _ in range(repetitions):
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            block(value, condition, positions)
+            block(value, condition, freqs)
     torch.cuda.synchronize(device)
     sampler.stop()
     for hook in hooks:

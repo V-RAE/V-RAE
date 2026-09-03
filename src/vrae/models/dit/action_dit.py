@@ -1,8 +1,8 @@
 """Action DiT expert for the V-RAE video/action model.
 
 The action stream follows the same conventions as :mod:`video_dit`: token
-attention, RMS normalization, SwiGLU feed-forward layers, and cosine/sine 3-D
-RoPE all come from the existing ``dit.blocks``/``rope3d`` modules.  Action
+attention, RMS normalization, SwiGLU feed-forward layers, and complex-frequency
+3-D RoPE come from the local ``dit.rope`` module.  Action
 tokens use a one-dimensional position grid ``(t, 0, 0)``.  This first version
 keeps the expert intentionally small: it has timestep-conditioned self-attention
 and an MLP, but no cross-attention.
@@ -22,10 +22,7 @@ from vrae.models.dit.blocks import (
     RMSNorm,
     modulate,
 )
-from vrae.models.rope3d import (
-    build_3d_positions,
-    build_video_dit_3d_rope_cache_from_positions,
-)
+from vrae.models.dit.rope import RoPE3D
 
 
 class ActionHead(nn.Module):
@@ -122,30 +119,10 @@ class ActionDiT(nn.Module):
         nn.init.normal_(self.time_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.time_embedder.mlp[2].weight, std=0.02)
 
-        # The action sequence is a 1-D video grid.  Buffers are non-persistent so
-        # checkpoints keep only learned weights, matching VRAEVideoDiT caches.
-        positions = build_3d_positions(1024, 1, 1)
-        cosine, sine = build_video_dit_3d_rope_cache_from_positions(
-            positions,
-            self.attn_head_dim,
-            theta=self.rope_theta,
-            dtype=torch.float32,
-        )
-        self.register_buffer("_rope_cosine", cosine, persistent=False)
-        self.register_buffer("_rope_sine", sine, persistent=False)
-        self.register_buffer("_positions", positions, persistent=False)
+        self.rope = RoPE3D(self.attn_head_dim, end=1024, theta=self.rope_theta)
 
-    def get_freqs(self, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if int(seq_len) <= 0 or int(seq_len) > self._rope_cosine.shape[0]:
-            raise ValueError(f"action sequence length must be in [1, {self._rope_cosine.shape[0]}]")
-        parameter = next(self.parameters())
-        return (
-            self._rope_cosine[:seq_len].to(device=parameter.device, dtype=parameter.dtype),
-            self._rope_sine[:seq_len].to(device=parameter.device, dtype=parameter.dtype),
-        )
-
-    def _positions_for(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        return self._positions[:seq_len].to(device=device)
+    def get_freqs(self, seq_len: int) -> torch.Tensor:
+        return self.rope(seq_len, 1, 1).to(device=next(self.parameters()).device)
 
     def _prepare(
         self,
@@ -177,7 +154,6 @@ class ActionDiT(nn.Module):
         return {
             "tokens": self.action_encoder(action_tokens),
             "freqs": self.get_freqs(seq_len),
-            "positions": self._positions_for(seq_len, action_tokens.device),
             "t": time_embedding,
             "t_mod": time_embedding,
             "context": context,
@@ -203,7 +179,7 @@ class ActionDiT(nn.Module):
         timestep: torch.Tensor,
         context: torch.Tensor,
         context_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         state = self._prepare(action_tokens, timestep, context, context_mask)
         return (
             state["tokens"],
@@ -232,8 +208,7 @@ class ActionDiT(nn.Module):
                     lambda current: block(
                         current,
                         state["t"],
-                        state["positions"],
-                        rope_cache=state["freqs"],
+                        state["freqs"],
                     ),
                     value,
                     use_reentrant=False,
@@ -242,8 +217,7 @@ class ActionDiT(nn.Module):
                 value = block(
                     value,
                     state["t"],
-                    state["positions"],
-                    rope_cache=state["freqs"],
+                    state["freqs"],
                 )
         return self.post_dit(value, state)
 

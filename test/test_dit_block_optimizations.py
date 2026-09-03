@@ -16,6 +16,7 @@ from torch import nn
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_fused_qkv_and_mlp_are_numerically_equivalent() -> None:
     from vrae.models.dit.blocks import AdaLNZeroDDTBlock, QKNormAttention, SwiGLUFeedForward
+    from vrae.models.dit.rope import apply_rope, RoPE3D
 
     class FusedAttention(QKNormAttention):
         def __init__(self, reference: QKNormAttention) -> None:
@@ -34,22 +35,17 @@ def test_fused_qkv_and_mlp_are_numerically_equivalent() -> None:
                 self.q_norm.load_state_dict(reference.q_norm.state_dict())
                 self.k_norm.load_state_dict(reference.k_norm.state_dict())
 
-        def forward(self, value, positions, attention_mask=None, *, rope_cache=None):
+        def forward(self, value, freqs, attention_mask=None):
             batch, length, _ = value.shape
             qkv = self.qkv(value).reshape(batch, length, 3, self.num_heads, self.head_dim)
             q, k, v = qkv.unbind(dim=2)
             q = self.q_norm(q.transpose(1, 2))
             k = self.k_norm(k.transpose(1, 2))
             v = v.transpose(1, 2)
-            if rope_cache is None:
-                from vrae.models.rope3d import apply_video_dit_3d_rope_to_positions
-                q = apply_video_dit_3d_rope_to_positions(q, positions, theta=self.rope_theta)
-                k = apply_video_dit_3d_rope_to_positions(k, positions, theta=self.rope_theta)
-            else:
-                from vrae.models.rope3d import apply_video_dit_3d_rope_cache
-                cosine, sine = rope_cache
-                q = apply_video_dit_3d_rope_cache(q, cosine, sine)
-                k = apply_video_dit_3d_rope_cache(k, cosine, sine)
+            q = apply_rope(q.transpose(1, 2).reshape(batch, length, self.dim), freqs, self.num_heads)
+            k = apply_rope(k.transpose(1, 2).reshape(batch, length, self.dim), freqs, self.num_heads)
+            q = q.reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
+            k = k.reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
             result = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False)
             return self.proj(result.transpose(1, 2).reshape(batch, length, self.dim))
 
@@ -76,12 +72,12 @@ def test_fused_qkv_and_mlp_are_numerically_equivalent() -> None:
     fused.mlp = FusedMLP(baseline.mlp).to(device).eval()
     value = torch.randn(2, 1280, 1536, device=device, dtype=torch.bfloat16)
     condition = torch.randn(2, 1536, device=device, dtype=torch.bfloat16)
-    positions = torch.zeros(1280, 3, device=device, dtype=torch.long)
+    freqs = RoPE3D(64, end=16)(5, 16, 16).to(device=device)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        baseline(value, condition, positions)
-        qkv_fused(value, condition, positions)
-        mlp_fused(value, condition, positions)
-        fused(value, condition, positions)
+        baseline(value, condition, freqs)
+        qkv_fused(value, condition, freqs)
+        mlp_fused(value, condition, freqs)
+        fused(value, condition, freqs)
     torch.cuda.synchronize()
 
     def run(block):
@@ -89,7 +85,7 @@ def test_fused_qkv_and_mlp_are_numerically_equivalent() -> None:
         end = torch.cuda.Event(enable_timing=True)
         start.record()
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            output = block(value, condition, positions)
+            output = block(value, condition, freqs)
         end.record()
         torch.cuda.synchronize()
         return output, start.elapsed_time(end)
@@ -106,8 +102,8 @@ def test_fused_qkv_and_mlp_are_numerically_equivalent() -> None:
     train_value_fused = value.detach().clone().requires_grad_(True)
     train_condition = condition.detach().clone()
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        baseline(train_value_base, train_condition, positions).float().square().mean().backward()
-        fused(train_value_fused, train_condition, positions).float().square().mean().backward()
+        baseline(train_value_base, train_condition, freqs).float().square().mean().backward()
+        fused(train_value_fused, train_condition, freqs).float().square().mean().backward()
     input_grad_error = (train_value_base.grad - train_value_fused.grad).abs().max().item()
     torch.testing.assert_close(train_value_fused.grad, train_value_base.grad, rtol=0.0, atol=5.0e-2)
     print(
@@ -126,9 +122,7 @@ def test_sdpa_vs_flash_attention() -> None:
     """Compare SDPA and flash-attn v2 with identical block weights and inputs."""
     from flash_attn import flash_attn_func
     from vrae.models.dit.blocks import AdaLNZeroDDTBlock, QKNormAttention
-    from vrae.models.rope3d import (
-        apply_video_dit_3d_rope_to_positions,
-    )
+    from vrae.models.dit.rope import apply_rope, RoPE3D
 
     class FlashAttention(QKNormAttention):
         def __init__(self, reference: QKNormAttention) -> None:
@@ -141,7 +135,7 @@ def test_sdpa_vs_flash_attention() -> None:
             )
             self.load_state_dict(reference.state_dict())
 
-        def forward(self, value, positions, attention_mask=None, *, rope_cache=None):
+        def forward(self, value, freqs, attention_mask=None):
             batch, length, _ = value.shape
             qkv = self.qkv(value).reshape(batch, length, 3, self.num_heads, self.head_dim)
             q, k, v = qkv.unbind(dim=2)
@@ -150,11 +144,10 @@ def test_sdpa_vs_flash_attention() -> None:
             v = v.transpose(1, 2)
             q = self.q_norm(q)
             k = self.k_norm(k)
-            if rope_cache is None:
-                q = apply_video_dit_3d_rope_to_positions(q, positions, theta=self.rope_theta)
-                k = apply_video_dit_3d_rope_to_positions(k, positions, theta=self.rope_theta)
-            else:
-                raise AssertionError("This comparison does not use a RoPE cache")
+            q = apply_rope(q.transpose(1, 2).reshape(batch, length, self.dim), freqs, self.num_heads)
+            k = apply_rope(k.transpose(1, 2).reshape(batch, length, self.dim), freqs, self.num_heads)
+            q = q.reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
+            k = k.reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
             if attention_mask is not None or (self.training and self.attention_dropout):
                 raise AssertionError("flash-attn comparison requires no mask/dropout")
             # flash-attn v2 uses [B, L, H, Dh], while the block stores [B, H, L, Dh].
@@ -175,12 +168,12 @@ def test_sdpa_vs_flash_attention() -> None:
     flash.attn = FlashAttention(sdpa.attn).to(device).eval()
     value = torch.randn(2, 1280, 1536, device=device, dtype=torch.bfloat16)
     condition = torch.randn(2, 1536, device=device, dtype=torch.bfloat16)
-    positions = torch.zeros(1280, 3, device=device, dtype=torch.long)
+    freqs = RoPE3D(64, end=16)(5, 16, 16).to(device=device)
 
     def run(block, repetitions=20):
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             for _ in range(3):
-                block(value, condition, positions)
+                block(value, condition, freqs)
         torch.cuda.synchronize()
         timings = []
         for _ in range(repetitions):
@@ -188,7 +181,7 @@ def test_sdpa_vs_flash_attention() -> None:
             end = torch.cuda.Event(enable_timing=True)
             start.record()
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                output = block(value, condition, positions)
+                output = block(value, condition, freqs)
             end.record()
             torch.cuda.synchronize()
             timings.append(start.elapsed_time(end))
@@ -203,8 +196,8 @@ def test_sdpa_vs_flash_attention() -> None:
     sdpa_value = value.detach().clone().requires_grad_(True)
     flash_value = value.detach().clone().requires_grad_(True)
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        sdpa(sdpa_value, condition, positions).float().square().mean().backward()
-        flash(flash_value, condition, positions).float().square().mean().backward()
+        sdpa(sdpa_value, condition, freqs).float().square().mean().backward()
+        flash(flash_value, condition, freqs).float().square().mean().backward()
     grad_error = (sdpa_value.grad - flash_value.grad).abs().max().item()
     torch.testing.assert_close(flash_value.grad, sdpa_value.grad, rtol=0.0, atol=8.0e-2)
     print(

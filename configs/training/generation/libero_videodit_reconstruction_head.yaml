@@ -21,7 +21,7 @@ data:
 latent_normalizer:
   path: ckpts/libero_videogen/latent_stats/vjepa2_1_libero_videodit_reconstruction_head.pt
 training:
-  resume: null
+  resume: ckpts/libero_videogen/vjepa2_1_libero_videodit_reconstruction_head/checkpoints/step-00011000.pt
   init_from: null
   global_batch_size: 16
   gradient_accumulation_steps: 2

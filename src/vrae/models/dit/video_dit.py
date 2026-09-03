@@ -14,15 +14,11 @@ from vrae.models.dit.blocks import (
     DDTFinalLayer,
     FramePatchEmbed,
     GaussianFourierTimeEmbedding,
-    VideoDiTRoPECache,
     embed_video_frames,
     unpatchify_video_tokens,
 )
 from vrae.models.dit.conditioning import LabelConditionAdapter
-from vrae.models.rope3d import (
-    build_3d_positions,
-    build_video_dit_3d_rope_cache_from_positions,
-)
+from vrae.models.dit.rope import RoPE3D
 from vrae.registry import DIT_MODELS
 
 
@@ -192,14 +188,16 @@ class VRAEVideoDiT(nn.Module):
         nn.init.zeros_(self.encoder_view_embedding.weight)
         nn.init.zeros_(self.decoder_view_embedding.weight)
 
-        positions = build_3d_positions(
-            self.num_chunks,
-            self.patch_grid[0],
-            self.patch_grid[1],
+        self.encoder_rope = RoPE3D(
+            enc_dim // enc_heads,
+            end=max(self.num_chunks, *self.patch_grid),
+            theta=rope_theta,
         )
-        self.register_buffer("_precomputed_positions", positions, persistent=False)
-        self._encoder_rope_cache: tuple[object, ...] | None = None
-        self._decoder_rope_cache: tuple[object, ...] | None = None
+        self.decoder_rope = RoPE3D(
+            dec_dim // dec_heads,
+            end=max(self.num_chunks, *self.patch_grid),
+            theta=rope_theta,
+        )
         self._initialize_weights()
 
     @property
@@ -251,8 +249,7 @@ class VRAEVideoDiT(nn.Module):
         block: AdaLNZeroDDTBlock,
         value: torch.Tensor,
         condition: torch.Tensor,
-        positions: torch.Tensor,
-        rope_cache: VideoDiTRoPECache,
+        freqs: torch.Tensor,
     ) -> torch.Tensor:
         if (
             self.gradient_checkpointing
@@ -263,8 +260,7 @@ class VRAEVideoDiT(nn.Module):
                 lambda current, cond: block(
                     current,
                     cond,
-                    positions,
-                    rope_cache=rope_cache,
+                    freqs,
                 ),
                 value,
                 condition,
@@ -273,42 +269,8 @@ class VRAEVideoDiT(nn.Module):
         return block(
             value,
             condition,
-            positions,
-            rope_cache=rope_cache,
+            freqs,
         )
-
-    def _cached_rope(
-        self,
-        *,
-        scope: str,
-        positions: torch.Tensor,
-        hidden: torch.Tensor,
-        block: AdaLNZeroDDTBlock,
-    ) -> VideoDiTRoPECache:
-        if positions.device != hidden.device:
-            raise ValueError(
-                "VideoDiT positions and hidden states must be on the same device"
-            )
-        attribute = f"_{scope}_rope_cache"
-        cached = getattr(self, attribute)
-        head_dim = block.attn.head_dim
-        theta = block.attn.rope_theta
-        if (
-            cached is None
-            or cached[0] is not positions
-            or cached[1] != hidden.dtype
-            or cached[2] != head_dim
-            or cached[3] != theta
-        ):
-            cosine, sine = build_video_dit_3d_rope_cache_from_positions(
-                positions,
-                head_dim,
-                theta=theta,
-                dtype=hidden.dtype,
-            )
-            cached = (positions, hidden.dtype, head_dim, theta, cosine, sine)
-            setattr(self, attribute, cached)
-        return cached[4], cached[5]
 
     def _unpatchify(self, value: torch.Tensor, *, batch_size: int) -> torch.Tensor:
         return unpatchify_video_tokens(
@@ -416,13 +378,12 @@ class VRAEVideoDiT(nn.Module):
         )
         return noisy, time, labels, drop_mask, stream_ids
 
-    def _build_positions(self, base: torch.Tensor, *, patches: int, views: int) -> torch.Tensor:
+    @staticmethod
+    def _expand_view_freqs(freqs: torch.Tensor, *, chunks: int, patches: int, views: int) -> torch.Tensor:
         if views == 1:
-            return base
-        return (
-            base.reshape(self.num_chunks, patches, 3)[:, None]
-            .expand(-1, views, -1, -1)
-            .reshape(-1, 3)
+            return freqs
+        return freqs.reshape(chunks, 1, patches, -1).expand(-1, views, -1, -1).reshape(
+            chunks * patches * views, 1, -1
         )
 
     def _embed_sequence(
@@ -433,7 +394,7 @@ class VRAEVideoDiT(nn.Module):
         batch_size: int,
         views: int,
         stream_ids: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Embed a prepared latent grid and add view-specific embeddings.
         """
         sequence = embed_video_frames(
@@ -470,11 +431,7 @@ class VRAEVideoDiT(nn.Module):
                 sequence.shape[-1],
             )
 
-        return sequence, self._build_positions(
-            self._precomputed_positions,
-            patches=patches,
-            views=views,
-        )
+        return sequence
 
 
     def _restore_output(self, tokens: torch.Tensor, *, batch: int, views: int) -> torch.Tensor:
@@ -505,7 +462,9 @@ class VRAEVideoDiT(nn.Module):
         int,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
         """Prepare validated inputs for the VideoDiT tensor core."""
         noisy, time, labels, drop_mask, stream_ids = self._validate_forward_inputs(
@@ -527,6 +486,18 @@ class VRAEVideoDiT(nn.Module):
         encoder_condition = time_embedding + label_embedding.to(
             time_embedding.dtype
         )
+        encoder_freqs = self._expand_view_freqs(
+            self.encoder_rope(self.num_chunks, self.patch_grid[0], self.patch_grid[1]),
+            chunks=self.num_chunks,
+            patches=self.patches_per_chunk,
+            views=views,
+        ).to(device=noisy.device)
+        decoder_freqs = self._expand_view_freqs(
+            self.decoder_rope(self.num_chunks, self.patch_grid[0], self.patch_grid[1]),
+            chunks=self.num_chunks,
+            patches=self.patches_per_chunk,
+            views=views,
+        ).to(device=noisy.device)
         return (
             grid,
             batch_size,
@@ -534,6 +505,8 @@ class VRAEVideoDiT(nn.Module):
             time_embedding,
             encoder_condition,
             stream_ids,
+            encoder_freqs,
+            decoder_freqs,
         )
 
     def _forward_core(
@@ -544,9 +517,11 @@ class VRAEVideoDiT(nn.Module):
         time_embedding: torch.Tensor,
         encoder_condition: torch.Tensor,
         stream_ids: torch.Tensor | None,
+        encoder_freqs: torch.Tensor,
+        decoder_freqs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run encoder and decoder blocks on prepared tensor inputs."""
-        sequence, encoder_positions = self._embed_sequence(
+        sequence = self._embed_sequence(
             self.encoder_embed,
             self.encoder_view_embedding,
             grid,
@@ -554,21 +529,13 @@ class VRAEVideoDiT(nn.Module):
             views,
             stream_ids,
         )
-        encoder_rope_cache = self._cached_rope(
-            scope="encoder",
-            positions=encoder_positions,
-            hidden=sequence,
-            block=self.encoder_blocks[0],
-        )
-
         base_sequence: torch.Tensor | None = None
         for index, block in enumerate(self.encoder_blocks, start=1):
             sequence = self._run_conditioned_block(
                 block,
                 sequence,
                 encoder_condition,
-                encoder_positions,
-                encoder_rope_cache,
+                encoder_freqs,
             )
             if index == self.base_model_depth:
                 base_sequence = sequence
@@ -578,7 +545,7 @@ class VRAEVideoDiT(nn.Module):
         decoder_condition = self.encoder_to_decoder(
             F.silu(time_embedding + sequence)
         )
-        decoder_sequence, decoder_positions = self._embed_sequence(
+        decoder_sequence = self._embed_sequence(
             self.decoder_embed,
             self.decoder_view_embedding,
             grid,
@@ -586,19 +553,12 @@ class VRAEVideoDiT(nn.Module):
             views,
             stream_ids,
         )
-        decoder_rope_cache = self._cached_rope(
-            scope="decoder",
-            positions=decoder_positions,
-            hidden=decoder_sequence,
-            block=self.decoder_blocks[0],
-        )
         for block in self.decoder_blocks:
             decoder_sequence = self._run_conditioned_block(
                 block,
                 decoder_sequence,
                 decoder_condition,
-                decoder_positions,
-                decoder_rope_cache,
+                decoder_freqs,
             )
 
         full_tokens = self.final_layer(decoder_sequence, decoder_condition)

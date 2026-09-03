@@ -858,10 +858,10 @@ def train_class_conditional(
     encoder_block = profiler("dit.encoder", gpu_util=True)(original_block)
     decoder_block = profiler("dit.decoder", gpu_util=True)(original_block)
 
-    def profiled_block(self, block, value, condition, positions, rope_cache):
+    def profiled_block(self, block, value, condition, freqs):
         if any(block is item for item in self.encoder_blocks):
-            return encoder_block(block, value, condition, positions, rope_cache)
-        return decoder_block(block, value, condition, positions, rope_cache)
+            return encoder_block(block, value, condition, freqs)
+        return decoder_block(block, value, condition, freqs)
 
     dit._run_conditioned_block = types.MethodType(profiled_block, dit)
     profiled_backward = profiler("dit.backward", gpu_util=True)(accumulation.backward)

@@ -11,12 +11,7 @@ from vrae.models.decoder import (
     _flash_attention,
     resolve_attention_backend,
 )
-from vrae.models.rope3d import (
-    apply_video_dit_3d_rope_cache,
-    apply_video_dit_3d_rope_to_positions,
-)
-
-VideoDiTRoPECache = tuple[torch.Tensor, torch.Tensor]
+from vrae.models.dit.rope import apply_rope
 
 
 def as_pair(value: int | Sequence[int], name: str) -> tuple[int, int]:
@@ -191,17 +186,15 @@ class QKNormAttention(nn.Module):
     def forward(
         self,
         value: torch.Tensor,
-        positions: torch.Tensor,
+        freqs: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        *,
-        rope_cache: VideoDiTRoPECache | None = None,
     ) -> torch.Tensor:
         if value.ndim != 3:
             raise ValueError(f"attention input must be [B,L,D], got {tuple(value.shape)}")
         batch, length, _ = value.shape
-        if positions.shape != (length, 3):
+        if freqs.shape[0] != length:
             raise ValueError(
-                f"positions must have shape [{length},3], got {tuple(positions.shape)}"
+                f"freqs must have shape [{length},1,R], got {tuple(freqs.shape)}"
             )
         qkv = self.qkv(value).reshape(
             batch,
@@ -216,13 +209,10 @@ class QKNormAttention(nn.Module):
         v = v.transpose(1, 2)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        if rope_cache is None:
-            q = apply_video_dit_3d_rope_to_positions(q, positions, theta=self.rope_theta)
-            k = apply_video_dit_3d_rope_to_positions(k, positions, theta=self.rope_theta)
-        else:
-            cosine, sine = rope_cache
-            q = apply_video_dit_3d_rope_cache(q, cosine, sine)
-            k = apply_video_dit_3d_rope_cache(k, cosine, sine)
+        q = apply_rope(q.transpose(1, 2).reshape(batch, length, self.dim), freqs, self.num_heads)
+        k = apply_rope(k.transpose(1, 2).reshape(batch, length, self.dim), freqs, self.num_heads)
+        q = q.reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
         dropout = self.attention_dropout if self.training else 0.0
         backend = resolve_attention_backend(
             self.attention_backend,
@@ -280,16 +270,13 @@ class DDTEncoderBlock(nn.Module):
     def forward(
         self,
         value: torch.Tensor,
-        positions: torch.Tensor,
+        freqs: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        *,
-        rope_cache: VideoDiTRoPECache | None = None,
     ) -> torch.Tensor:
         value = value + self.attn(
             self.norm1(value),
-            positions,
+            freqs,
             attention_mask,
-            rope_cache=rope_cache,
         )
         return value + self.mlp(self.norm2(value))
 
@@ -326,10 +313,8 @@ class AdaLNZeroDDTBlock(DDTEncoderBlock):
         self,
         value: torch.Tensor,
         condition: torch.Tensor,
-        positions: torch.Tensor,
+        freqs: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        *,
-        rope_cache: VideoDiTRoPECache | None = None,
     ) -> torch.Tensor:
         if condition.ndim == 2:
             condition = condition[:, None]
@@ -342,9 +327,8 @@ class AdaLNZeroDDTBlock(DDTEncoderBlock):
         )
         attended = self.attn(
             modulate(self.norm1(value), shift_a, scale_a),
-            positions,
+            freqs,
             attention_mask,
-            rope_cache=rope_cache,
         )
         value = value + gate_a * attended
         fed_forward = self.mlp(modulate(self.norm2(value), shift_m, scale_m))

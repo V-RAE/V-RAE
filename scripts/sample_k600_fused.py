@@ -26,6 +26,7 @@ from vrae.training.common.visualization import save_video_mp4
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/training/generation/k600_videodit.yaml")
     parser.add_argument("--dit-checkpoint", default="ckpts/k600_dit/k600_dit_vjepa2.1.pt")
     parser.add_argument("--vrae-checkpoint", default="ckpts/vrae/vrae_vjepa2.1.pt")
     parser.add_argument("--latent-stats", default="ckpts/k600_dit/k600_latent_stats_vjepa2.1.pt")
@@ -36,13 +37,14 @@ def main() -> None:
 
     root = Path.cwd()
     paths = ProjectPaths(project_root=root)
-    config = load_config("configs/training/generation/k600_videodit.yaml")
+    config = load_config(args.config)
     config["stage1"]["checkpoint"] = args.vrae_checkpoint
     config["latent_normalizer"]["path"] = args.latent_stats
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     stage1, _ = load_frozen_stage1(config, paths, device)
-    dit = build_class_conditional_dit(config, stage1.metadata(), num_chunks=5).to(device)
+    num_chunks = int(config["data"]["num_frames"]) // 4
+    dit = build_class_conditional_dit(config, stage1.metadata(), num_chunks=num_chunks).to(device)
     payload = load_checkpoint(paths.checkpoint(args.dit_checkpoint))
     incompatible = dit.load_state_dict(payload["model"], strict=False)
     allowed_missing = {"encoder_view_embedding.weight", "decoder_view_embedding.weight"}

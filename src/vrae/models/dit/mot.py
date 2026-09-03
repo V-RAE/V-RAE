@@ -17,7 +17,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from vrae.models.dit.blocks import modulate
-from vrae.models.rope3d import apply_video_dit_3d_rope_cache as apply_rope
+from vrae.models.dit.rope import apply_rope
 
 
 class MoT(nn.Module):
@@ -130,7 +130,7 @@ class MoT(nn.Module):
         expert: nn.Module,
         block: nn.Module,
         x: torch.Tensor,
-        freqs: tuple[torch.Tensor, torch.Tensor],
+        freqs: torch.Tensor,
         t_mod: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = MoT._split_modulation(block, t_mod)
@@ -142,8 +142,8 @@ class MoT(nn.Module):
         v = attention.v(normalized)
         q = attention.q_norm(q)
         k = attention.k_norm(k)
-        q = apply_rope(q, freqs[0], freqs[1]).transpose(1, 2).reshape(batch, length, -1)
-        k = apply_rope(k, freqs[0], freqs[1]).transpose(1, 2).reshape(batch, length, -1)
+        q = apply_rope(q.transpose(1, 2).reshape(batch, length, -1), freqs, attention.num_heads)
+        k = apply_rope(k.transpose(1, 2).reshape(batch, length, -1), freqs, attention.num_heads)
         return q, k, v, x, gate_a, shift_m, scale_m, gate_m
 
     @staticmethod
@@ -197,7 +197,7 @@ class MoT(nn.Module):
     def prefill_video_cache(
         self,
         video_tokens: torch.Tensor,
-        video_freqs: tuple[torch.Tensor, torch.Tensor],
+        video_freqs: torch.Tensor,
         video_t_mod: torch.Tensor,
         video_context_payload: Optional[dict],
         video_attention_mask: torch.Tensor,
@@ -216,7 +216,7 @@ class MoT(nn.Module):
     def forward_action_with_video_cache(
         self,
         action_tokens: torch.Tensor,
-        action_freqs: tuple[torch.Tensor, torch.Tensor],
+        action_freqs: torch.Tensor,
         action_t_mod: torch.Tensor,
         action_context_payload: Optional[dict],
         video_kv_cache: list[dict[str, torch.Tensor]],
@@ -238,7 +238,7 @@ class MoT(nn.Module):
     def prefill_video_cache_tensor(
         self,
         video_tokens: torch.Tensor,
-        video_freqs: tuple[torch.Tensor, torch.Tensor],
+        video_freqs: torch.Tensor,
         video_t_mod: torch.Tensor,
         video_context: torch.Tensor,
         video_context_mask: torch.Tensor,
@@ -262,7 +262,7 @@ class MoT(nn.Module):
     def forward_action_with_video_cache_tensor(
         self,
         action_tokens: torch.Tensor,
-        action_freqs: tuple[torch.Tensor, torch.Tensor],
+        action_freqs: torch.Tensor,
         action_t_mod: torch.Tensor,
         action_context: torch.Tensor,
         action_context_mask: torch.Tensor,
@@ -296,8 +296,8 @@ class MoT(nn.Module):
         action_block: nn.Module,
         video_tokens: torch.Tensor,
         action_tokens: torch.Tensor,
-        video_freqs: tuple[torch.Tensor, torch.Tensor],
-        action_freqs: tuple[torch.Tensor, torch.Tensor],
+        video_freqs: torch.Tensor,
+        action_freqs: torch.Tensor,
         video_t_mod: torch.Tensor,
         action_t_mod: torch.Tensor,
         video_context: torch.Tensor,
@@ -325,8 +325,8 @@ class MoT(nn.Module):
         self,
         video_tokens: torch.Tensor,
         action_tokens: torch.Tensor,
-        video_freqs: tuple[torch.Tensor, torch.Tensor],
-        action_freqs: tuple[torch.Tensor, torch.Tensor],
+        video_freqs: torch.Tensor,
+        action_freqs: torch.Tensor,
         video_t_mod: torch.Tensor,
         action_t_mod: torch.Tensor,
         video_context: torch.Tensor,
@@ -353,7 +353,7 @@ class MoT(nn.Module):
         self,
         embeds_all: Dict[str, torch.Tensor],
         attention_mask: torch.Tensor,
-        freqs_all: Dict[str, tuple[torch.Tensor, torch.Tensor]],
+        freqs_all: Dict[str, torch.Tensor],
         context_all: Dict[str, Optional[dict]],
         t_mod_all: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
