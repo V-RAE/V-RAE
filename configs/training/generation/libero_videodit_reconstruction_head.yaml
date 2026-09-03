@@ -29,7 +29,7 @@ runtime:
   profile:
     gpu_util: true
     gpu_util_interval_seconds: 0.02
-    synchronize_phases: true
+    synchronize_phases: false
 wandb:
   group: libero_videogen_reconstruction_head
   tags: [libero, reconstruction, head, single_view, vjepa2_1]
