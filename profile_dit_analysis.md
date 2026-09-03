@@ -112,6 +112,62 @@ CUDA Event 稳定约 `6.6 ms`，而 Python wall 只有约 `3.6 ms`，证明 CUDA
 
 当前 attention GPU 利用率和子模块时间只能用于趋势判断，不能用于精确排序。要得到可信的 attention GPU 时间，phase decorator 需要在入口/出口记录 CUDA Event，并在窗口汇总时读取 Event elapsed；NVML 均值应同时报告样本数和覆盖时长。
 
+## 最新训练 Profile（step 10700）
+
+本节更新自 `ckpts/libero_videogen/vjepa2_1_libero_videodit_reconstruction_head` 的本地 W&B run（run id `609c8596e1f84796b2402fe1ed9fd200`）。当前目录最新完整 checkpoint 为 `checkpoints/step-00010000.pt`；日志已记录到 step 10700，训练仍在继续。
+
+| 项目 | 值 |
+|---|---:|
+| 配置 | `configs/training/generation/libero_videodit_reconstruction_head.yaml` |
+| GPU / 精度 | H100 80GB / BF16 |
+| global batch / microbatch | 16 / 8 |
+| gradient accumulation | 2 |
+| profile 窗口 | 87.72 s，20 updates |
+| updates/s / samples/s | 0.2280 / 3.648 |
+| data wait / H2D | 0.553 / 2.742 ms |
+| Stage1 | 1312.40 ms |
+| DIT 总体（profile） | 813.58 ms |
+| DIT 总体（Python phase） | 784.90 ms |
+| optimizer update | 28.92 ms |
+| allocated / reserved | 28.67 / 70.16 GiB |
+| 全局 peak allocated | 65.14 GiB |
+| loss（step 10700） | 0.54627 |
+| loss_full / loss_base | 0.23167 / 0.31460 |
+
+### DIT 主阶段
+
+| 阶段 | 调用次数 | 平均时间/ms |
+|---|---:|---:|
+| `dit.forward` | 40 | 553.13 |
+| `dit.prepare` | 40 | 2.39 |
+| `dit.forward_core` | 40 | 549.16 |
+| `dit.encoder` | 1120 | 17.83 |
+| `dit.decoder` | 80 | 16.13 |
+| `dit.post` | 40 | 0.11 |
+| `dit.backward` | 40 | 226.67 |
+
+### Encoder / Decoder 子模块
+
+| 子模块 | 调用次数 | 平均时间/ms |
+|---|---:|---:|
+| encoder `adaln_modulation` | 1120 | 0.222 |
+| encoder `norm1` | 1120 | 0.307 |
+| encoder `attn` | 1120 | 13.030 |
+| encoder `norm2` | 1120 | 0.335 |
+| encoder `mlp` | 1120 | 0.448 |
+| decoder `adaln_modulation` | 80 | 0.192 |
+| decoder `norm1` | 80 | 0.289 |
+| decoder `attn` | 80 | 11.956 |
+| decoder `norm2` | 80 | 0.301 |
+| decoder `mlp` | 80 | 0.405 |
+
+### 最新趋势
+
+- 相比早期 200-step 窗口，当前 `dit_ms` 已降至约 `813.6 ms`，但这里的 profile 仍是 Python phase 计时，不能直接当作严格 CUDA elapsed。
+- `forward_core` 占 `dit.forward` 的约 99.3%；attention 仍是 encoder/decoder 各自的主要耗时项，分别为 `13.03/11.96 ms` 每次调用。
+- 当前 profile 的显存 reserved 为 `70.16 GiB`，peak allocated 为 `65.14 GiB`；相比早期窗口，缓存分配器保留量更高，但仍未达到 H100 80GB 容量上限。
+- `attention_backend: auto` 的 decoder 运行元数据仍显示解析为 `sdpa`；本机安装 FA4 不会自动改变这次训练 run 的历史 profile。
+
 ## 同步边界实验（50 steps）
 
 配置新增 `runtime.profile.synchronize_phases: true`。DIT 主 phase 在入口和出口执行 CUDA synchronize；高频子模块保持非同步包装，避免每个 norm/attention/MLP 调用都触发全局同步。
