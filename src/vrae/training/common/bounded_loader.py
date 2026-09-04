@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -84,6 +85,9 @@ class AsyncPrefetchLoader:
 
     def release_epoch_memory(self) -> dict[str, float]:
         return self.loader.release_epoch_memory()
+
+    def profile_snapshot(self, *, reset: bool = False) -> dict[str, float]:
+        return self.loader.profile_snapshot(reset=reset)
 
     def close(self) -> None:
         self.loader.close()
@@ -214,6 +218,9 @@ class BoundedThreadBatchLoader:
         )
         self._iterator_lock = threading.Lock()
         self._closed = False
+        self._profile_lock = threading.Lock()
+        self._profile_collate_seconds = 0.0
+        self._profile_collate_batches = 0
         self._executor = ThreadPoolExecutor(
             max_workers=self.decode_threads,
             thread_name_prefix=f"lerobot-cpu-rank{self.rank}",
@@ -260,7 +267,25 @@ class BoundedThreadBatchLoader:
             metrics["memory/host_process_rss_reclaimed_gb"] = max(0.0, before_rss - after_rss)
         return metrics
 
+    def profile_snapshot(self, *, reset: bool = False) -> dict[str, float]:
+        result = {}
+        dataset_snapshot = getattr(self.dataset, "profile_snapshot", None)
+        if callable(dataset_snapshot):
+            result.update(dataset_snapshot(reset=reset))
+        with self._profile_lock:
+            collate_seconds = self._profile_collate_seconds
+            collate_batches = self._profile_collate_batches
+            if reset:
+                self._profile_collate_seconds = 0.0
+                self._profile_collate_batches = 0
+        result["profile/data_detail.batch_count"] = float(collate_batches)
+        result["profile/data_detail.batch.collate_ms"] = (
+            collate_seconds / max(collate_batches, 1) * 1000.0
+        )
+        return result
+
     def _collate(self, items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        started_at = time.perf_counter()
         if not items:
             raise RuntimeError("Cannot collate an empty video batch")
         expected_shape = tuple(items[0]["video"].shape)
@@ -308,6 +333,9 @@ class BoundedThreadBatchLoader:
             batch["task"] = [item["task"] for item in items]
         if "prompt" in items[0]:
             batch["prompt"] = [item["prompt"] for item in items]
+        with self._profile_lock:
+            self._profile_collate_seconds += time.perf_counter() - started_at
+            self._profile_collate_batches += 1
         return batch
 
     def _iterate(self) -> Iterator[dict[str, Any]]:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 import json
+import threading
+import time
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -13,7 +15,12 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from vrae.data.lerobot3.lerobot_dataset import LeRobotDataset
+import datasets
+import pyarrow.dataset as pa_dataset
+from torchvision.io import decode_image
+from vrae.data.lerobot3.lerobot_dataset import LeRobotDatasetMetadata
+from vrae.data.lerobot3.utils import get_hf_features_from_features
+from vrae.data.lerobot3.video_utils import decode_video_frames, get_safe_default_codec
 
 
 @dataclass(frozen=True)
@@ -69,6 +76,10 @@ def _resize_short_side(video: torch.Tensor, image_size: int) -> torch.Tensor:
     _, _, height, width = video.shape
     scale = max(image_size / height, image_size / width)
     target = (max(image_size, round(height * scale)), max(image_size, round(width * scale)))
+    if target == (height, width):
+        return video
+    if video.dtype == torch.uint8:
+        video = video.float().div_(255.0)
     return F.interpolate(video, size=target, mode="bilinear", align_corners=False, antialias=True)
 
 
@@ -79,11 +90,11 @@ def _random_crop(video: torch.Tensor, image_size: int, generator: torch.Generato
     return video[:, :, top : top + image_size, left : left + image_size]
 
 
-class ReconstructionDataset(LeRobotDataset):
+class ReconstructionDataset(torch.utils.data.Dataset):
     """Sample strict, random, single-view clips from a LeRobot manifest.
 
-    The LeRobot reader owns metadata/parquet loading.  This class only adds
-    manifest filtering, temporal sampling, and reconstruction augmentations.
+    This reader loads only the metadata and raw columns needed for temporal
+    sampling and reconstruction augmentations.
     """
 
     def __init__(
@@ -109,7 +120,12 @@ class ReconstructionDataset(LeRobotDataset):
             raise ValueError("frame_interval must be positive")
         if frame_interval_min <= 0 or frame_interval_max < frame_interval_min:
             raise ValueError("frame interval bounds are invalid")
-        super().__init__(repo_id, root=Path(root))
+        self.repo_id = repo_id
+        self.root = Path(root)
+        self.meta = LeRobotDatasetMetadata(repo_id, root=self.root)
+        self.tolerance_s = 1e-4
+        self.video_backend = get_safe_default_codec()
+        self.during_training = True
         self._manifest_episodes = load_libero_manifest(manifest)
         requested_cameras = camera_keys or []
         self.camera_keys = tuple(
@@ -139,6 +155,41 @@ class ReconstructionDataset(LeRobotDataset):
                 for episode, views in self._manifest_episodes.items()
                 if all(any(view.view_key == view_key for view in views) for view_key in requested_views)
             }
+        self.episodes = list(range(self.meta.total_episodes))
+        manifest_camera_keys = [
+            view.view_key
+            for views in self._manifest_episodes.values()
+            for view in views
+        ]
+        data_columns = list(dict.fromkeys(
+            [camera["key"] for camera in self.camera_keys] + manifest_camera_keys
+            + ["timestamp"]
+        ))
+        data_paths = sorted((self.root / "data").glob("*/*.parquet"))
+        if not data_paths:
+            raise FileNotFoundError(f"No parquet files found under {self.root / 'data'}.")
+        # Reuse the normal LeRobot parquet cache, then keep only the columns
+        # needed by reconstruction.  Changing the input column list would
+        # force datasets to rebuild a second 33 GB-derived Arrow cache.
+        parquet_dataset = datasets.Dataset.from_parquet(
+            [str(path) for path in data_paths],
+            features=get_hf_features_from_features(self.meta.features),
+            columns=list(self.meta.features),
+            filters=pa_dataset.field("episode_index").isin(self.episodes),
+        )
+        self.hf_dataset = parquet_dataset.select_columns(data_columns)
+        episode_lengths = torch.tensor(
+            [int(self.meta.episodes[index]["length"]) for index in self.episodes],
+            dtype=torch.long,
+        )
+        episode_ends = torch.cumsum(episode_lengths, dim=0)
+        self.episode_data_index = {
+            "from": torch.cat((torch.zeros(1, dtype=torch.long), episode_ends[:-1])),
+            "to": episode_ends,
+        }
+        self._episode_id_to_nested_id = {
+            episode_id: nested_id for nested_id, episode_id in enumerate(self.episodes)
+        }
         self.reconstruction_num_frames = int(num_frames)
         self.frame_interval = int(frame_interval)
         self.random_frame_interval = bool(random_frame_interval)
@@ -213,6 +264,9 @@ class ReconstructionDataset(LeRobotDataset):
         }
         self.class_names = tuple(task for _task_index, task in task_rows)
         self.num_classes = len(self.class_names)
+        self._profile_lock = threading.Lock()
+        self._profile_totals = defaultdict(float)
+        self._profile_sample_count = 0
 
     def __len__(self) -> int:
         return len(self._episodes)
@@ -255,6 +309,54 @@ class ReconstructionDataset(LeRobotDataset):
             (self.seed + epoch * 1_000_003 + int(index) * 10_007) % (2**63 - 1)
         )
 
+    def _record_profile(self, name: str, seconds: float) -> None:
+        with self._profile_lock:
+            self._profile_totals[name] += float(seconds)
+
+    def profile_snapshot(self, *, reset: bool = False) -> dict[str, float]:
+        with self._profile_lock:
+            sample_count = int(self._profile_sample_count)
+            totals = dict(self._profile_totals)
+            if reset:
+                self._profile_sample_count = 0
+                self._profile_totals.clear()
+        result = {"profile/data_detail.sample_count": float(sample_count)}
+        for name, seconds in totals.items():
+            result[f"profile/data_detail.{name}_ms"] = (
+                float(seconds) / max(sample_count, 1) * 1000.0
+            )
+        return result
+
+    def _decode_image_frame(self, key: str, index: int) -> torch.Tensor:
+        # Access Arrow storage directly so reading one timestamp does not run
+        # the Hugging Face transform over every image column in the selected rows.
+        value = self.hf_dataset.data[key][int(index)].as_py()
+        if isinstance(value, dict) and value.get("bytes") is not None:
+            encoded = torch.frombuffer(
+                bytearray(value["bytes"]), dtype=torch.uint8
+            )
+            return decode_image(encoded, mode="RGB")
+        raise ValueError(
+            f"Expected inline image bytes for {key!r}; got {type(value).__name__}"
+        )
+
+    def _query_videos(
+        self, query_timestamps: dict[str, list[float]], episode_index: int
+    ) -> dict[str, torch.Tensor]:
+        episode = self.meta.episodes[int(episode_index)]
+        result = {}
+        for video_key, timestamps in query_timestamps.items():
+            start_timestamp = episode[f"videos/{video_key}/from_timestamp"]
+            shifted_timestamps = [start_timestamp + timestamp for timestamp in timestamps]
+            video_path = self.root / self.meta.get_video_file_path(episode_index, video_key)
+            result[video_key] = decode_video_frames(
+                video_path,
+                shifted_timestamps,
+                self.tolerance_s,
+                self.video_backend,
+            ).squeeze(0)
+        return result
+
     def _choose_view_and_interval(
         self, views: Sequence[LiberoManifestView], generator: torch.Generator
     ) -> tuple[tuple[LiberoManifestView, ...], int] | None:
@@ -279,6 +381,7 @@ class ReconstructionDataset(LeRobotDataset):
         return None
 
     def __getitem__(self, index: int) -> dict[str, Any]:
+        sample_started_at = time.perf_counter()
         episode = self._episodes[int(index)]
         generator = self._generator(index)
         selected = self._choose_view_and_interval(self._manifest_episodes[episode], generator)
@@ -294,17 +397,23 @@ class ReconstructionDataset(LeRobotDataset):
         nested_episode_index = self._episode_id_to_nested_id[episode]
         episode_start = int(self.episode_data_index["from"][nested_episode_index])
         global_indices = episode_start + local_indices
-        rows = self.hf_dataset.select(global_indices.tolist())
         videos: list[torch.Tensor] = []
         crop_top = crop_left = None
+        rows = None
         for selected_view in selected_views:
+            decode_started_at = time.perf_counter()
             if selected_view.view_key in self.meta.video_keys:
+                if rows is None:
+                    rows = self.hf_dataset.select(global_indices.tolist())
                 timestamps = [float(value) for value in rows["timestamp"]]
                 video = self._query_videos(
                     {selected_view.view_key: timestamps}, episode
                 )[selected_view.view_key]
             else:
-                frames = [torch.as_tensor(value) for value in rows[selected_view.view_key]]
+                frames = [
+                    self._decode_image_frame(selected_view.view_key, frame_index)
+                    for frame_index in global_indices
+                ]
                 video = torch.stack(frames)
                 if video.ndim != 4:
                     raise ValueError(f"Expected [T,H,W,C] or [T,C,H,W], got {tuple(video.shape)}")
@@ -312,9 +421,8 @@ class ReconstructionDataset(LeRobotDataset):
                     video = video.permute(0, 3, 1, 2)
                 elif video.shape[1] != 3:
                     raise ValueError(f"Expected RGB frames, got {tuple(video.shape)}")
-                video = video.float()
-                if float(video.max()) > 1.0:
-                    video = video / 255.0
+            self._record_profile("sample.decode", time.perf_counter() - decode_started_at)
+            preprocess_started_at = time.perf_counter()
             video = _resize_short_side(video, self.image_size)
             if crop_top is None:
                 _, _, height, width = video.shape
@@ -322,10 +430,17 @@ class ReconstructionDataset(LeRobotDataset):
                 crop_left = int(torch.randint(width - self.image_size + 1, (), generator=generator).item())
             video = video[:, :, crop_top : crop_top + self.image_size, crop_left : crop_left + self.image_size]
             videos.append(video)
+            self._record_profile(
+                "sample.resize_crop", time.perf_counter() - preprocess_started_at
+            )
+        assemble_started_at = time.perf_counter()
         video = torch.stack(videos, dim=1) if len(self.camera_keys) > 1 else videos[0]
         if self.random_flip and bool(torch.rand((), generator=generator) < 0.5):
             video = video.flip(-1)
-        return {
+        self._record_profile(
+            "sample.assemble", time.perf_counter() - assemble_started_at
+        )
+        result = {
             "video": video.contiguous(),
             "label": self._resolve_label(view, episode),
             "sample_id": f"episode-{episode:06d}",
@@ -335,6 +450,10 @@ class ReconstructionDataset(LeRobotDataset):
             "frame_interval": interval,
             **({"stream_ids": torch.tensor([camera["stream_id"] for camera in self.camera_keys], dtype=torch.long)} if self.camera_keys else {}),
         }
+        with self._profile_lock:
+            self._profile_sample_count += 1
+            self._profile_totals["sample.total"] += time.perf_counter() - sample_started_at
+        return result
 
     def _resolve_label(self, view: LiberoManifestView, episode: int) -> int:
         if view.task_index is not None:

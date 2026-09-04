@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import types
 import random
 import time
 from collections.abc import Mapping
@@ -860,59 +859,15 @@ def train_class_conditional(
         ),
     )
 
-    # Sample GPU utilization only for large phases. Nested phases retain timing
-    # measurements without replacing the active GPU-utilization phase.
+    # Profile only the four large phases. Small module wrappers add overhead
+    # and make the timing report harder to interpret.
     profiler.register_phase("data.loading", gpu_util=True)
-    dit.prepare = profiler("dit.prepare", gpu_util=False)(dit.prepare)
-    dit.forward = profiler("dit.forward.inner", gpu_util=False)(dit.forward)
-    dit._forward_core = profiler("dit.forward_core", gpu_util=False)(
-        dit._forward_core
-    )
-    dit.post = profiler("dit.post", gpu_util=False)(dit.post)
-    original_block = dit._run_conditioned_block
-    encoder_block = profiler("dit.encoder", gpu_util=False)(original_block)
-    decoder_block = profiler("dit.decoder", gpu_util=False)(original_block)
-
-    def profiled_block(self, block, value, condition, freqs):
-        if any(block is item for item in self.encoder_blocks):
-            return encoder_block(block, value, condition, freqs)
-        return decoder_block(block, value, condition, freqs)
-
-    dit._run_conditioned_block = types.MethodType(profiled_block, dit)
-    profiled_backward = profiler("dit.backward.inner", gpu_util=False)(
-        accumulation.backward
-    )
-
-    # Aggregate timings/utilization for the main submodules used by every
-    # encoder and decoder block.  The original module forwards are preserved.
-    def register_block_submodules(blocks, prefix: str) -> None:
-        for block in blocks:
-            for name in ("adaln_modulation", "norm1", "norm2", "attn", "mlp"):
-                module = getattr(block, name, None)
-                if module is None:
-                    continue
-                phase = profiler(
-                    f"dit.{prefix}.{name}",
-                    gpu_util=False,
-                    synchronize=False,
-                )
-                module.forward = phase(module.forward)
-
-    register_block_submodules(dit.encoder_blocks, "encoder")
-    register_block_submodules(dit.decoder_blocks, "decoder")
-
-    encode_grid = profiler("stage1.encode_grid", gpu_util=False)(
-        stage1.encode_grid
-    )
-    grid_to_tokens = profiler("stage1.grid_to_tokens", gpu_util=False)(
-        stage1.grid_to_tokens
-    )
 
     @profiler("stage1", gpu_util=True)
     def run_stage1(flat_video: torch.Tensor, *, multiview: bool, views: int):
         with torch.no_grad():
-            flat_grid = encode_grid(flat_video)
-            flat_tokens = grid_to_tokens(flat_grid)
+            flat_grid = stage1.encode_grid(flat_video)
+            flat_tokens = stage1.grid_to_tokens(flat_grid)
             if multiview:
                 batch_size, _, tokens, channels = flat_tokens.shape
                 clean = flat_tokens.reshape(
@@ -950,9 +905,10 @@ def train_class_conditional(
 
     @profiler("dit.backward", gpu_util=True)
     def run_dit_backward(loss: torch.Tensor):
-        profiled_backward(loss, scaler)
+        accumulation.backward(loss, scaler)
 
-    profile_windows: list[dict[str, Any]] = []
+    profile_average_metrics: dict[str, float] = {}
+    profile_metric_counts: dict[str, int] = {}
 
     def nest_profile_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
         """Expand ``namespace/path.with.dots`` names into nested JSON objects."""
@@ -976,33 +932,26 @@ def train_class_conditional(
     def write_profile_report() -> None:
         if not context.is_main:
             return
-        average_metrics: dict[str, float] = {}
-        metric_counts: dict[str, int] = {}
-        for window in profile_windows:
-            for name, value in window["metrics"].items():
-                if isinstance(value, (int, float)):
-                    average_metrics[name] = average_metrics.get(name, 0.0) + float(value)
-                    metric_counts[name] = metric_counts.get(name, 0) + 1
-        for name, count in metric_counts.items():
-            average_metrics[name] /= count
-        nested_windows = [
-            {
-                **window,
-                "metrics": nest_profile_metrics(window["metrics"]),
-            }
-            for window in profile_windows
-        ]
         save_profile_json(
             {
-                "version": 1,
+                "version": 2,
                 "run_name": str(config["run_name"]),
                 "warmup_steps": profile_warmup_steps,
                 "interval_steps": profile_interval_steps,
-                "windows": nested_windows,
-                "average_metrics": nest_profile_metrics(average_metrics),
+                "average_metrics": nest_profile_metrics(profile_average_metrics),
             },
             profile_output_path,
         )
+
+    def update_profile_average(metrics: Mapping[str, Any]) -> None:
+        for name, value in metrics.items():
+            if isinstance(value, (int, float)):
+                count = profile_metric_counts.get(name, 0) + 1
+                previous = profile_average_metrics.get(name, 0.0)
+                profile_average_metrics[name] = previous + (
+                    float(value) - previous
+                ) / count
+                profile_metric_counts[name] = count
 
     def profiled_batches():
         iterator = iter(loader)
@@ -1019,6 +968,9 @@ def train_class_conditional(
             profiler.end_phase("data.loading")
             yield batch
 
+    reset_data_profile = getattr(loader, "profile_snapshot", None)
+    if callable(reset_data_profile):
+        reset_data_profile(reset=True)
     profiler.start()
     write_profile_report()
     training_started_at = time.perf_counter()
@@ -1089,7 +1041,7 @@ def train_class_conditional(
             loss_log_due = step % log_interval == 0
             profile_due = (
                 step > profile_warmup_steps
-                and (step - profile_warmup_steps) % profile_interval_steps == 0
+                and step % profile_interval_steps == 0
             )
             if loss_log_due:
                 train_window_seconds = time.perf_counter() - train_window_started_at
@@ -1120,19 +1072,16 @@ def train_class_conditional(
                     updates=profile_window_updates,
                     global_batch_size=batch_contract.global_batch_size,
                 )
+                data_profile = getattr(loader, "profile_snapshot", None)
+                if callable(data_profile):
+                    profile_metrics.update(data_profile(reset=True))
                 host_metrics = (
                     distributed_host_memory_metrics(context.device)
                     if log_host_memory or min_host_available_gb > 0.0
                     else {}
                 )
                 profile_metrics = {**profile_metrics, **host_metrics}
-                profile_windows.append(
-                    {
-                        "step_start": step - profile_window_updates + 1,
-                        "step_end": step,
-                        "metrics": profile_metrics,
-                    }
-                )
+                update_profile_average(profile_metrics)
                 write_profile_report()
                 min_available_gb = host_metrics.get("memory/host_available_min_gb")
                 memory_guard_triggered = (
@@ -1339,10 +1288,14 @@ def train_class_conditional(
                 profile_window_started_at = time.perf_counter()
                 profile_window_updates = 0
                 profiler.reset()
+                if callable(reset_data_profile):
+                    reset_data_profile(reset=True)
             elif reset_profile_window:
                 profile_window_started_at = time.perf_counter()
                 profile_window_updates = 0
                 profiler.reset()
+                if callable(reset_data_profile):
+                    reset_data_profile(reset=True)
             if loss_log_due:
                 train_window_started_at = time.perf_counter()
                 train_window_updates = 0
