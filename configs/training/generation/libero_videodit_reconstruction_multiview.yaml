@@ -1,0 +1,41 @@
+include:
+  - libero_videodit.yaml
+
+task: libero_videogen
+run_name: vjepa2_1_libero_videodit_reconstruction_multiview
+model:
+  multiview:
+    enabled: true
+    num_views: 2
+data:
+  dataset: reconstruction
+  manifest: data/metadata/libero_reconstruction.csv
+  view_key: null
+  camera_keys:
+    - {key: observation.images.image, name: head, stream_id: 0}
+    - {key: observation.images.image2, name: wrist, stream_id: 1}
+  num_frames: 20
+  frame_interval: 3
+  random_frame_interval: false
+  frame_interval_min: 1
+  frame_interval_max: 4
+latent_normalizer:
+  path: ckpts/libero_videogen/latent_stats/vjepa2_1_libero_videodit_reconstruction_multiview.pt
+transport:
+  time_dist_shift: 25.298221281347036
+training:
+  resume: ckpts/libero_videogen/vjepa2_1_libero_videodit_reconstruction_multiview/checkpoints/step-00001000.pt
+  init_from: null
+  global_batch_size: 16
+  gradient_accumulation_steps: 4
+runtime:
+  profile:
+    gpu_util: true
+    gpu_util_interval_seconds: 0.02
+    synchronize_phases: false
+    warmup_steps: 20
+    interval_steps: 20
+    output_file: profile.json
+wandb:
+  group: libero_videogen_reconstruction_multiview
+  tags: [libero, reconstruction, multiview, vjepa2_1]

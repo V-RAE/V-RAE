@@ -1,4 +1,4 @@
-"""Manifest-backed, single-view LeRobot dataset for reconstruction training."""
+"""Manifest-backed LeRobot dataset for reconstruction training."""
 
 from __future__ import annotations
 
@@ -94,6 +94,7 @@ class ReconstructionDataset(LeRobotDataset):
         repo_id: str = "libero",
         num_frames: int = 16,
         view_key: str | None = None,
+        camera_keys: Sequence[dict[str, Any]] | None = None,
         frame_interval: int = 3,
         random_frame_interval: bool = False,
         frame_interval_min: int = 1,
@@ -110,6 +111,15 @@ class ReconstructionDataset(LeRobotDataset):
             raise ValueError("frame interval bounds are invalid")
         super().__init__(repo_id, root=Path(root))
         self._manifest_episodes = load_libero_manifest(manifest)
+        requested_cameras = camera_keys or []
+        self.camera_keys = tuple(
+            {
+                "key": str(camera["key"]),
+                "name": str(camera.get("name", camera["key"])),
+                "stream_id": int(camera.get("stream_id", index)),
+            }
+            for index, camera in enumerate(requested_cameras)
+        )
         if view_key is not None:
             requested_view = str(view_key)
             self._manifest_episodes = {
@@ -118,6 +128,16 @@ class ReconstructionDataset(LeRobotDataset):
             }
             self._manifest_episodes = {
                 episode: views for episode, views in self._manifest_episodes.items() if views
+            }
+        if self.camera_keys:
+            requested_views = tuple(camera["key"] for camera in self.camera_keys)
+            self._manifest_episodes = {
+                episode: tuple(
+                    next(view for view in views if view.view_key == view_key)
+                    for view_key in requested_views
+                )
+                for episode, views in self._manifest_episodes.items()
+                if all(any(view.view_key == view_key for view in views) for view_key in requested_views)
             }
         self.reconstruction_num_frames = int(num_frames)
         self.frame_interval = int(frame_interval)
@@ -166,14 +186,14 @@ class ReconstructionDataset(LeRobotDataset):
             valid = {
                 episode: views
                 for episode, views in manifest_views.items()
-                if any(view.frame_count >= min_required for view in views)
+                if all(view.frame_count >= min_required for view in views)
             }
         else:
             required = 1 + (self.reconstruction_num_frames - 1) * self.frame_interval
             valid = {
                 episode: views
                 for episode, views in manifest_views.items()
-                if any(view.frame_count >= required for view in views)
+                if all(view.frame_count >= required for view in views)
             }
         self._episode_rows = known_episodes
         self._episodes = tuple(sorted(valid))
@@ -237,7 +257,7 @@ class ReconstructionDataset(LeRobotDataset):
 
     def _choose_view_and_interval(
         self, views: Sequence[LiberoManifestView], generator: torch.Generator
-    ) -> tuple[LiberoManifestView, int] | None:
+    ) -> tuple[tuple[LiberoManifestView, ...], int] | None:
         valid_views = list(views)
         if self.random_frame_interval:
             candidate = int(
@@ -254,9 +274,8 @@ class ReconstructionDataset(LeRobotDataset):
         for interval in intervals:
             required = 1 + (self.reconstruction_num_frames - 1) * interval
             valid = [view for view in valid_views if view.frame_count >= required]
-            if valid:
-                view = valid[int(torch.randint(len(valid), (), generator=generator).item())]
-                return view, interval
+            if valid and len(valid) == len(valid_views):
+                return tuple(valid), interval
         return None
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -265,7 +284,8 @@ class ReconstructionDataset(LeRobotDataset):
         selected = self._choose_view_and_interval(self._manifest_episodes[episode], generator)
         if selected is None:
             raise IndexError(f"episode {episode} has no valid clip")
-        view, interval = selected
+        selected_views, interval = selected
+        view = selected_views[0]
         required = 1 + (self.reconstruction_num_frames - 1) * interval
         max_start = view.frame_count - required
         start = int(torch.randint(max_start + 1, (), generator=generator).item())
@@ -275,23 +295,34 @@ class ReconstructionDataset(LeRobotDataset):
         episode_start = int(self.episode_data_index["from"][nested_episode_index])
         global_indices = episode_start + local_indices
         rows = self.hf_dataset.select(global_indices.tolist())
-        if view.view_key in self.meta.video_keys:
-            timestamps = [float(value) for value in rows["timestamp"]]
-            video = self._query_videos({view.view_key: timestamps}, episode)[view.view_key]
-        else:
-            frames = [torch.as_tensor(value) for value in rows[view.view_key]]
-            video = torch.stack(frames)
-            if video.ndim != 4:
-                raise ValueError(f"Expected [T,H,W,C] or [T,C,H,W], got {tuple(video.shape)}")
-            if video.shape[-1] == 3:
-                video = video.permute(0, 3, 1, 2)
-            elif video.shape[1] != 3:
-                raise ValueError(f"Expected RGB frames, got {tuple(video.shape)}")
-            video = video.float()
-            if float(video.max()) > 1.0:
-                video = video / 255.0
-        video = _resize_short_side(video, self.image_size)
-        video = _random_crop(video, self.image_size, generator)
+        videos: list[torch.Tensor] = []
+        crop_top = crop_left = None
+        for selected_view in selected_views:
+            if selected_view.view_key in self.meta.video_keys:
+                timestamps = [float(value) for value in rows["timestamp"]]
+                video = self._query_videos(
+                    {selected_view.view_key: timestamps}, episode
+                )[selected_view.view_key]
+            else:
+                frames = [torch.as_tensor(value) for value in rows[selected_view.view_key]]
+                video = torch.stack(frames)
+                if video.ndim != 4:
+                    raise ValueError(f"Expected [T,H,W,C] or [T,C,H,W], got {tuple(video.shape)}")
+                if video.shape[-1] == 3:
+                    video = video.permute(0, 3, 1, 2)
+                elif video.shape[1] != 3:
+                    raise ValueError(f"Expected RGB frames, got {tuple(video.shape)}")
+                video = video.float()
+                if float(video.max()) > 1.0:
+                    video = video / 255.0
+            video = _resize_short_side(video, self.image_size)
+            if crop_top is None:
+                _, _, height, width = video.shape
+                crop_top = int(torch.randint(height - self.image_size + 1, (), generator=generator).item())
+                crop_left = int(torch.randint(width - self.image_size + 1, (), generator=generator).item())
+            video = video[:, :, crop_top : crop_top + self.image_size, crop_left : crop_left + self.image_size]
+            videos.append(video)
+        video = torch.stack(videos, dim=1) if len(self.camera_keys) > 1 else videos[0]
         if self.random_flip and bool(torch.rand((), generator=generator) < 0.5):
             video = video.flip(-1)
         return {
@@ -302,6 +333,7 @@ class ReconstructionDataset(LeRobotDataset):
             "episode_index": episode,
             "view": view.view_key,
             "frame_interval": interval,
+            **({"stream_ids": torch.tensor([camera["stream_id"] for camera in self.camera_keys], dtype=torch.long)} if self.camera_keys else {}),
         }
 
     def _resolve_label(self, view: LiberoManifestView, episode: int) -> int:

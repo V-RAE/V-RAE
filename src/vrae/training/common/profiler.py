@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import os
 import threading
 import time
@@ -37,6 +38,9 @@ class TrainingProfiler:
         self._phase_specs: dict[str, bool] = {}
         self._phase_lock = threading.Lock()
         self._active_phase: str | None = None
+        self._active_gpu_phase: str | None = None
+        self._manual_phase_started_at: dict[str, float] = {}
+        self._manual_phase_previous: tuple[str | None, str | None] | None = None
         self._gpu_sampler_thread: threading.Thread | None = None
         self._gpu_sampler_running = False
         self._nvml = None
@@ -83,7 +87,10 @@ class TrainingProfiler:
                 started_at = time.perf_counter()
                 with self._phase_lock:
                     previous_phase = self._active_phase
+                    previous_gpu_phase = self._active_gpu_phase
                     self._active_phase = phase_name
+                    if collect_gpu_util:
+                        self._active_gpu_phase = phase_name
                 try:
                     return function(*args, **kwargs)
                 finally:
@@ -93,7 +100,7 @@ class TrainingProfiler:
                     with self._phase_lock:
                         self._phase_duration_seconds[phase_name] += elapsed
                         self._phase_duration_count[phase_name] += 1
-                        if self.cuda_enabled:
+                        if self.cuda_enabled and collect_gpu_util:
                             allocated = torch.cuda.memory_allocated(self.device) / float(1024**3)
                             reserved = torch.cuda.memory_reserved(self.device) / float(1024**3)
                             self._phase_allocated_gb_sum[phase_name] += allocated
@@ -107,6 +114,7 @@ class TrainingProfiler:
                                 reserved,
                             )
                         self._active_phase = previous_phase
+                        self._active_gpu_phase = previous_gpu_phase
 
             return wrapped
 
@@ -158,7 +166,7 @@ class TrainingProfiler:
     def _sample_gpu_utilization(self) -> None:
         while self._gpu_sampler_running:
             with self._phase_lock:
-                phase = self._active_phase
+                phase = self._active_gpu_phase
                 collect_gpu_util = bool(self._phase_specs.get(phase, False))
             if phase is not None and collect_gpu_util:
                 utilization = self._nvml.nvmlDeviceGetUtilizationRates(
@@ -187,6 +195,8 @@ class TrainingProfiler:
         self._phase_allocated_gb_max: dict[str, float] = {}
         self._phase_reserved_gb_sum: dict[str, float] = {}
         self._phase_reserved_gb_max: dict[str, float] = {}
+        self._manual_phase_started_at = {}
+        self._manual_phase_previous = None
         with self._phase_lock:
             for phase in self._phase_specs:
                 self._phase_duration_seconds[phase] = 0.0
@@ -203,6 +213,78 @@ class TrainingProfiler:
         self.data_wait_seconds += float(seconds)
         self.data_wait_max_seconds = max(self.data_wait_max_seconds, float(seconds))
         self.data_wait_batches += 1
+
+    def register_phase(self, phase: str, *, gpu_util: bool = False) -> None:
+        """Register a manually measured phase without wrapping a function."""
+
+        phase_name = str(phase).strip()
+        if not phase_name:
+            raise ValueError("Profiler phase name must be non-empty")
+        collect_gpu_util = bool(gpu_util)
+        registered = self._phase_specs.get(phase_name)
+        if registered is not None and registered != collect_gpu_util:
+            raise ValueError(
+                f"Profiler phase {phase_name!r} was registered with a different gpu_util setting"
+            )
+        self._phase_specs[phase_name] = collect_gpu_util
+        self._phase_duration_seconds.setdefault(phase_name, 0.0)
+        self._phase_duration_count.setdefault(phase_name, 0)
+        self._phase_gpu_sm_sum.setdefault(phase_name, 0.0)
+        self._phase_gpu_memory_sum.setdefault(phase_name, 0.0)
+        self._phase_gpu_sample_count.setdefault(phase_name, 0)
+        self._phase_allocated_gb_sum.setdefault(phase_name, 0.0)
+        self._phase_allocated_gb_max.setdefault(phase_name, 0.0)
+        self._phase_reserved_gb_sum.setdefault(phase_name, 0.0)
+        self._phase_reserved_gb_max.setdefault(phase_name, 0.0)
+
+    def begin_phase(self, phase: str) -> None:
+        """Begin a manually measured phase, such as waiting for a batch."""
+
+        phase_name = str(phase).strip()
+        if phase_name not in self._phase_specs:
+            raise ValueError(f"Profiler phase {phase_name!r} was not registered")
+        with self._phase_lock:
+            if self._active_phase is not None:
+                raise RuntimeError(
+                    f"Cannot begin phase {phase_name!r} while {self._active_phase!r} is active"
+                )
+            self._manual_phase_previous = (
+                self._active_phase,
+                self._active_gpu_phase,
+            )
+            self._active_phase = phase_name
+            if self._phase_specs[phase_name]:
+                self._active_gpu_phase = phase_name
+            self._manual_phase_started_at[phase_name] = time.perf_counter()
+
+    def end_phase(self, phase: str) -> None:
+        """Finish a manually measured phase."""
+
+        phase_name = str(phase).strip()
+        with self._phase_lock:
+            if self._active_phase != phase_name:
+                raise RuntimeError(f"Profiler phase {phase_name!r} is not active")
+            started_at = self._manual_phase_started_at.pop(phase_name)
+            elapsed = time.perf_counter() - started_at
+            self._phase_duration_seconds[phase_name] += elapsed
+            self._phase_duration_count[phase_name] += 1
+            if self.cuda_enabled and self._phase_specs[phase_name]:
+                allocated = torch.cuda.memory_allocated(self.device) / float(1024**3)
+                reserved = torch.cuda.memory_reserved(self.device) / float(1024**3)
+                self._phase_allocated_gb_sum[phase_name] += allocated
+                self._phase_allocated_gb_max[phase_name] = max(
+                    self._phase_allocated_gb_max[phase_name],
+                    allocated,
+                )
+                self._phase_reserved_gb_sum[phase_name] += reserved
+                self._phase_reserved_gb_max[phase_name] = max(
+                    self._phase_reserved_gb_max[phase_name],
+                    reserved,
+                )
+            previous_phase, previous_gpu_phase = self._manual_phase_previous or (None, None)
+            self._active_phase = previous_phase
+            self._active_gpu_phase = previous_gpu_phase
+            self._manual_phase_previous = None
 
     def begin_batch(self) -> None:
         if self.cuda_enabled:
@@ -309,35 +391,52 @@ class TrainingProfiler:
             for phase, collect_gpu_util in self._phase_specs.items():
                 duration_count = self._phase_duration_count[phase]
                 if duration_count:
-                    metrics[f"profile/{phase}_duration_ms"] = (
+                    metrics[f"profile/{phase}.duration_ms"] = (
                         self._phase_duration_seconds[phase]
                         / duration_count
                         * 1000.0
                     )
-                    metrics[f"profile/{phase}_duration_count"] = float(duration_count)
-                    metrics[f"profile_memory/{phase}_allocated_gb_mean"] = (
-                        self._phase_allocated_gb_sum[phase] / duration_count
-                    )
-                    metrics[f"profile_memory/{phase}_allocated_gb_max"] = (
-                        self._phase_allocated_gb_max[phase]
-                    )
-                    metrics[f"profile_memory/{phase}_reserved_gb_mean"] = (
-                        self._phase_reserved_gb_sum[phase] / duration_count
-                    )
-                    metrics[f"profile_memory/{phase}_reserved_gb_max"] = (
-                        self._phase_reserved_gb_max[phase]
-                    )
+                    metrics[f"profile/{phase}.duration_count"] = float(duration_count)
+                    if collect_gpu_util:
+                        metrics[f"profile_memory/{phase}.allocated_gb.mean"] = (
+                            self._phase_allocated_gb_sum[phase] / duration_count
+                        )
+                        metrics[f"profile_memory/{phase}.allocated_gb.max"] = (
+                            self._phase_allocated_gb_max[phase]
+                        )
+                        metrics[f"profile_memory/{phase}.reserved_gb.mean"] = (
+                            self._phase_reserved_gb_sum[phase] / duration_count
+                        )
+                        metrics[f"profile_memory/{phase}.reserved_gb.max"] = (
+                            self._phase_reserved_gb_max[phase]
+                        )
                 if collect_gpu_util:
                     sample_count = self._phase_gpu_sample_count[phase]
                     if sample_count:
-                        metrics[f"profile_gpu/{phase}_sm_util_mean"] = (
+                        metrics[f"profile_gpu/{phase}.sm_util.mean"] = (
                             self._phase_gpu_sm_sum[phase] / sample_count
                         )
-                        metrics[f"profile_gpu/{phase}_memory_util_mean"] = (
+                        metrics[f"profile_gpu/{phase}.memory_util.mean"] = (
                             self._phase_gpu_memory_sum[phase] / sample_count
                         )
-                        metrics[f"profile_gpu/{phase}_sample_count"] = float(sample_count)
+                        metrics[f"profile_gpu/{phase}.sample_count"] = float(sample_count)
         return metrics
+
+
+def save_profile_json(payload: Mapping[str, Any], path: str | Path) -> Path:
+    """Atomically overwrite the single JSON profile artifact."""
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(dict(payload), handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return output
 
 
 def run_fine_profile(

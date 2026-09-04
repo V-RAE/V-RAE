@@ -270,6 +270,7 @@ class ClassConditionalVideoDataset:
                 repo_id=str(data.get("repo_id", "libero")),
                 num_frames=int(data["num_frames"]),
                 view_key=(str(data["view_key"]) if data.get("view_key") else None),
+                camera_keys=data.get("camera_keys"),
                 frame_interval=int(data.get("frame_interval", 3)),
                 random_frame_interval=bool(data.get("random_frame_interval", False)),
                 frame_interval_min=int(data.get("frame_interval_min", 1)),
@@ -639,7 +640,7 @@ def train_class_conditional(
     )
     from vrae.training.common.optim import build_optimizer, build_scheduler
     from vrae.training.common.precision import PrecisionPolicy
-    from vrae.training.common.profiler import TrainingProfiler
+    from vrae.training.common.profiler import TrainingProfiler, save_profile_json
     from vrae.training.common.visualization import save_sample_tensors, video_to_uint8
     from vrae.training.common.wandb import WandbLogger
 
@@ -828,6 +829,18 @@ def train_class_conditional(
     if min_host_available_gb < 0.0:
         raise ValueError("runtime.host_memory.min_available_gb must be non-negative")
 
+    profile_warmup_steps = int(profile_runtime.get("warmup_steps", 20))
+    profile_interval_steps = int(
+        profile_runtime.get("interval_steps", config["wandb"]["log_interval"])
+    )
+    if profile_warmup_steps < 0:
+        raise ValueError("runtime.profile.warmup_steps must be non-negative")
+    if profile_interval_steps <= 0:
+        raise ValueError("runtime.profile.interval_steps must be positive")
+    profile_output_path = Path(str(profile_runtime.get("output_file", "profile.json")))
+    if not profile_output_path.is_absolute():
+        profile_output_path = run / profile_output_path
+
     epochs = int(config["training"].get("epochs", 1))
     last_saved_step = step
     stop = False
@@ -847,16 +860,18 @@ def train_class_conditional(
         ),
     )
 
-    # Register semantic DIT phases.  The wrappers preserve the model API while
-    # allowing the sampler to attribute samples to prepare/core/post and the
-    # encoder/decoder block aggregates.
-    dit.prepare = profiler("dit.prepare", gpu_util=True)(dit.prepare)
-    dit.forward = profiler("dit.forward", gpu_util=True)(dit.forward)
-    dit._forward_core = profiler("dit.forward_core", gpu_util=True)(dit._forward_core)
-    dit.post = profiler("dit.post", gpu_util=True)(dit.post)
+    # Sample GPU utilization only for large phases. Nested phases retain timing
+    # measurements without replacing the active GPU-utilization phase.
+    profiler.register_phase("data.loading", gpu_util=True)
+    dit.prepare = profiler("dit.prepare", gpu_util=False)(dit.prepare)
+    dit.forward = profiler("dit.forward.inner", gpu_util=False)(dit.forward)
+    dit._forward_core = profiler("dit.forward_core", gpu_util=False)(
+        dit._forward_core
+    )
+    dit.post = profiler("dit.post", gpu_util=False)(dit.post)
     original_block = dit._run_conditioned_block
-    encoder_block = profiler("dit.encoder", gpu_util=True)(original_block)
-    decoder_block = profiler("dit.decoder", gpu_util=True)(original_block)
+    encoder_block = profiler("dit.encoder", gpu_util=False)(original_block)
+    decoder_block = profiler("dit.decoder", gpu_util=False)(original_block)
 
     def profiled_block(self, block, value, condition, freqs):
         if any(block is item for item in self.encoder_blocks):
@@ -864,7 +879,9 @@ def train_class_conditional(
         return decoder_block(block, value, condition, freqs)
 
     dit._run_conditioned_block = types.MethodType(profiled_block, dit)
-    profiled_backward = profiler("dit.backward", gpu_util=True)(accumulation.backward)
+    profiled_backward = profiler("dit.backward.inner", gpu_util=False)(
+        accumulation.backward
+    )
 
     # Aggregate timings/utilization for the main submodules used by every
     # encoder and decoder block.  The original module forwards are preserved.
@@ -876,7 +893,7 @@ def train_class_conditional(
                     continue
                 phase = profiler(
                     f"dit.{prefix}.{name}",
-                    gpu_util=True,
+                    gpu_util=False,
                     synchronize=False,
                 )
                 module.forward = phase(module.forward)
@@ -884,11 +901,18 @@ def train_class_conditional(
     register_block_submodules(dit.encoder_blocks, "encoder")
     register_block_submodules(dit.decoder_blocks, "decoder")
 
+    encode_grid = profiler("stage1.encode_grid", gpu_util=False)(
+        stage1.encode_grid
+    )
+    grid_to_tokens = profiler("stage1.grid_to_tokens", gpu_util=False)(
+        stage1.grid_to_tokens
+    )
+
     @profiler("stage1", gpu_util=True)
     def run_stage1(flat_video: torch.Tensor, *, multiview: bool, views: int):
         with torch.no_grad():
-            flat_grid = stage1.encode_grid(flat_video)
-            flat_tokens = stage1.grid_to_tokens(flat_grid)
+            flat_grid = encode_grid(flat_video)
+            flat_tokens = grid_to_tokens(flat_grid)
             if multiview:
                 batch_size, _, tokens, channels = flat_tokens.shape
                 clean = flat_tokens.reshape(
@@ -902,34 +926,106 @@ def train_class_conditional(
                 clean = flat_tokens
             return normalizer.normalize(clean)
 
-    @profiler("dit", gpu_util=True)
-    def run_dit(
+    @profiler("dit.forward", gpu_util=True)
+    def run_dit_forward(
         clean: torch.Tensor,
         labels: torch.Tensor,
         stream_ids: torch.Tensor | None,
     ):
-        with accumulation.sync_context(model):
-            with precision.autocast():
-                losses = transport.training_losses(
-                    model,
-                    clean,
-                    model_kwargs={
-                        "labels": labels,
-                        **(
-                            {"stream_ids": stream_ids}
-                            if stream_ids is not None
-                            else {}
-                        ),
-                    },
-                )
-                loss = losses["loss"]
-            profiled_backward(loss, scaler)
+        with precision.autocast():
+            losses = transport.training_losses(
+                model,
+                clean,
+                model_kwargs={
+                    "labels": labels,
+                    **(
+                        {"stream_ids": stream_ids}
+                        if stream_ids is not None
+                        else {}
+                    ),
+                },
+            )
+            loss = losses["loss"]
         return losses, loss
 
+    @profiler("dit.backward", gpu_util=True)
+    def run_dit_backward(loss: torch.Tensor):
+        profiled_backward(loss, scaler)
+
+    profile_windows: list[dict[str, Any]] = []
+
+    def nest_profile_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
+        """Expand ``namespace/path.with.dots`` names into nested JSON objects."""
+
+        nested: dict[str, Any] = {}
+        for name, value in metrics.items():
+            parts = str(name).split("/", 1)
+            path = parts[0].split(".")
+            if len(parts) == 2:
+                path.extend(parts[1].split("."))
+            target = nested
+            for part in path[:-1]:
+                child = target.get(part)
+                if not isinstance(child, dict):
+                    child = {}
+                    target[part] = child
+                target = child
+            target[path[-1]] = value
+        return nested
+
+    def write_profile_report() -> None:
+        if not context.is_main:
+            return
+        average_metrics: dict[str, float] = {}
+        metric_counts: dict[str, int] = {}
+        for window in profile_windows:
+            for name, value in window["metrics"].items():
+                if isinstance(value, (int, float)):
+                    average_metrics[name] = average_metrics.get(name, 0.0) + float(value)
+                    metric_counts[name] = metric_counts.get(name, 0) + 1
+        for name, count in metric_counts.items():
+            average_metrics[name] /= count
+        nested_windows = [
+            {
+                **window,
+                "metrics": nest_profile_metrics(window["metrics"]),
+            }
+            for window in profile_windows
+        ]
+        save_profile_json(
+            {
+                "version": 1,
+                "run_name": str(config["run_name"]),
+                "warmup_steps": profile_warmup_steps,
+                "interval_steps": profile_interval_steps,
+                "windows": nested_windows,
+                "average_metrics": nest_profile_metrics(average_metrics),
+            },
+            profile_output_path,
+        )
+
+    def profiled_batches():
+        iterator = iter(loader)
+        while True:
+            profiler.begin_phase("data.loading")
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                profiler.end_phase("data.loading")
+                return
+            except BaseException:
+                profiler.end_phase("data.loading")
+                raise
+            profiler.end_phase("data.loading")
+            yield batch
+
     profiler.start()
+    write_profile_report()
     training_started_at = time.perf_counter()
-    throughput_window_started_at = time.perf_counter()
-    throughput_window_updates = 0
+    train_window_started_at = time.perf_counter()
+    train_window_updates = 0
+    profile_window_started_at = time.perf_counter()
+    profile_window_updates = 0
     for epoch in range(start_epoch, epochs):
         epoch_started_at = time.perf_counter()
         if context.is_main:
@@ -941,7 +1037,7 @@ def train_class_conditional(
         if callable(set_epoch):
             set_epoch(epoch)
         batch_requested_at = time.perf_counter()
-        for batch in loader:
+        for batch in profiled_batches():
             batch_received_at = time.perf_counter()
             data_wait = batch_received_at - batch_requested_at
             profiler.record_data_wait(data_wait)
@@ -966,7 +1062,9 @@ def train_class_conditional(
             profiler.finish_h2d()
             clean = run_stage1(flat_video, multiview=multiview, views=views)
             profiler.finish_stage1()
-            losses, loss = run_dit(clean, labels, stream_ids)
+            with accumulation.sync_context(model):
+                losses, loss = run_dit_forward(clean, labels, stream_ids)
+                run_dit_backward(loss)
             profiler.finish_backward()
             sampler.commit_batch()
             if not accumulation.advance():
@@ -984,10 +1082,17 @@ def train_class_conditional(
             ema.update(dit)
             profiler.finish_update()
             step += 1
-            throughput_window_updates += 1
+            train_window_updates += 1
+            if step > profile_warmup_steps:
+                profile_window_updates += 1
             log_interval = int(config["wandb"]["log_interval"])
-            if step % log_interval == 0:
-                window_seconds = time.perf_counter() - throughput_window_started_at
+            loss_log_due = step % log_interval == 0
+            profile_due = (
+                step > profile_warmup_steps
+                and (step - profile_warmup_steps) % profile_interval_steps == 0
+            )
+            if loss_log_due:
+                train_window_seconds = time.perf_counter() - train_window_started_at
                 reduced_losses = reduce_mean(
                     torch.stack(
                         (
@@ -998,9 +1103,21 @@ def train_class_conditional(
                     ).detach()
                 )
                 reduced_loss, reduced_loss_full, reduced_loss_base = reduced_losses.unbind()
+                train_updates_per_second = train_window_updates / max(
+                    train_window_seconds, 1.0e-9
+                )
+                train_ms_per_step = 1000.0 / train_updates_per_second
+            else:
+                reduced_loss = None
+                reduced_loss_full = None
+                reduced_loss_base = None
+                train_updates_per_second = None
+                train_ms_per_step = None
+            if profile_due:
+                profile_window_seconds = time.perf_counter() - profile_window_started_at
                 profile_metrics = profiler.summarize(
-                    window_seconds=window_seconds,
-                    updates=throughput_window_updates,
+                    window_seconds=profile_window_seconds,
+                    updates=profile_window_updates,
                     global_batch_size=batch_contract.global_batch_size,
                 )
                 host_metrics = (
@@ -1008,26 +1125,28 @@ def train_class_conditional(
                     if log_host_memory or min_host_available_gb > 0.0
                     else {}
                 )
-                updates_per_second = profile_metrics["profile/updates_per_second"]
-                ms_per_step = 1000.0 / updates_per_second
+                profile_metrics = {**profile_metrics, **host_metrics}
+                profile_windows.append(
+                    {
+                        "step_start": step - profile_window_updates + 1,
+                        "step_end": step,
+                        "metrics": profile_metrics,
+                    }
+                )
+                write_profile_report()
                 min_available_gb = host_metrics.get("memory/host_available_min_gb")
                 memory_guard_triggered = (
                     min_host_available_gb > 0.0
                     and min_available_gb is not None
                     and min_available_gb < min_host_available_gb
                 )
-                reset_throughput_window = True
+                reset_profile_window = True
             else:
-                reduced_loss = None
-                reduced_loss_full = None
-                reduced_loss_base = None
-                updates_per_second = None
-                ms_per_step = None
                 profile_metrics = {}
                 host_metrics = {}
                 min_available_gb = None
                 memory_guard_triggered = False
-                reset_throughput_window = False
+                reset_profile_window = False
             if context.is_main and reduced_loss is not None:
                 print(
                     _training_progress_line(
@@ -1037,41 +1156,43 @@ def train_class_conditional(
                         loss=float(reduced_loss.item()),
                         loss_full=float(reduced_loss_full.item()),
                         loss_base=float(reduced_loss_base.item()),
-                        ms_per_step=ms_per_step,
+                        ms_per_step=train_ms_per_step,
                     ),
                     flush=True,
                 )
-                print(
-                    "[profile] "
-                    f"window={profile_metrics['profile/window_elapsed_sec']:.2f}s "
-                    f"updates={int(profile_metrics['profile/window_updates'])} "
-                    f"data_wait={profile_metrics['profile/data_wait_ms_mean']:.1f}ms "
-                    f"h2d={profile_metrics['profile/h2d_ms']:.1f}ms "
-                    f"stage1={profile_metrics['profile/stage1_ms']:.1f}ms "
-                    f"dit={profile_metrics['profile/dit_ms']:.1f}ms "
-                    f"update={profile_metrics['profile/update_ms']:.1f}ms "
-                    f"allocated={profile_metrics['profile/allocated_gb']:.1f}GiB "
-                    f"reserved={profile_metrics['profile/reserved_gb']:.1f}GiB "
-                    f"peak={profile_metrics['profile/max_allocated_gb']:.1f}GiB",
-                    flush=True,
-                )
-                logger.log(
-                    {
-                        "train/loss": float(reduced_loss.item()),
-                        "train/loss_total": float(reduced_loss.item()),
-                        "train/loss_full": float(reduced_loss_full.item()),
-                        "train/loss_base": float(reduced_loss_base.item()),
-                        "train/epoch": epoch,
-                        "train/lr": optimizer.param_groups[0]["lr"],
-                        "train/learning_rate": optimizer.param_groups[0]["lr"],
-                        "train/step_time_sec": 1.0 / updates_per_second,
-                        "train/steps_per_sec": updates_per_second,
-                        "train/global_batch_size": batch_contract.global_batch_size,
-                        **profile_metrics,
-                        **host_metrics,
-                    },
-                    step=step,
-                )
+                if profile_due:
+                    print(
+                        "[profile] "
+                        f"window={profile_metrics['profile/window_elapsed_sec']:.2f}s "
+                        f"updates={int(profile_metrics['profile/window_updates'])} "
+                        f"data_wait={profile_metrics['profile/data_wait_ms_mean']:.1f}ms "
+                        f"h2d={profile_metrics['profile/h2d_ms']:.1f}ms "
+                        f"stage1={profile_metrics['profile/stage1_ms']:.1f}ms "
+                        f"dit={profile_metrics['profile/dit_ms']:.1f}ms "
+                        f"update={profile_metrics['profile/update_ms']:.1f}ms "
+                        f"allocated={profile_metrics['profile/allocated_gb']:.1f}GiB "
+                        f"reserved={profile_metrics['profile/reserved_gb']:.1f}GiB "
+                        f"peak={profile_metrics['profile/max_allocated_gb']:.1f}GiB",
+                        flush=True,
+                    )
+                train_metrics = {
+                    "train/loss": float(reduced_loss.item()),
+                    "train/loss_total": float(reduced_loss.item()),
+                    "train/loss_full": float(reduced_loss_full.item()),
+                    "train/loss_base": float(reduced_loss_base.item()),
+                    "train/epoch": epoch,
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                    "train/learning_rate": optimizer.param_groups[0]["lr"],
+                    "train/global_batch_size": batch_contract.global_batch_size,
+                }
+                if train_updates_per_second is not None:
+                    train_metrics.update(
+                        {
+                            "train/step_time_sec": 1.0 / train_updates_per_second,
+                            "train/steps_per_sec": train_updates_per_second,
+                        }
+                    )
+                logger.log(train_metrics, step=step)
             if memory_guard_triggered:
                 accumulation.require_boundary()
                 rng_state = gather_rng_states()
@@ -1214,10 +1335,17 @@ def train_class_conditional(
             if max_steps is not None and step >= max_steps:
                 stop = True
                 break
-            if reset_throughput_window:
-                throughput_window_started_at = time.perf_counter()
-                throughput_window_updates = 0
+            if step == profile_warmup_steps:
+                profile_window_started_at = time.perf_counter()
+                profile_window_updates = 0
                 profiler.reset()
+            elif reset_profile_window:
+                profile_window_started_at = time.perf_counter()
+                profile_window_updates = 0
+                profiler.reset()
+            if loss_log_due:
+                train_window_started_at = time.perf_counter()
+                train_window_updates = 0
             batch_requested_at = time.perf_counter()
         if stop:
             break

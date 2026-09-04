@@ -32,12 +32,13 @@ def main() -> None:
     parser.add_argument("--latent-stats", default="ckpts/k600_dit/k600_latent_stats_vjepa2.1.pt")
     parser.add_argument("--output-dir", default="test/vis/k600_fused_check")
     parser.add_argument("--class-id", type=int, default=0)
-    parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument("--steps", type=int, default=None)
     args = parser.parse_args()
 
     root = Path.cwd()
     paths = ProjectPaths(project_root=root)
     config = load_config(args.config)
+    sampling = config.get("sampling", {})
     config["stage1"]["checkpoint"] = args.vrae_checkpoint
     config["latent_normalizer"]["path"] = args.latent_stats
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -65,15 +66,15 @@ def main() -> None:
             transport=transport,
             sample_ids=[3407],
             labels=torch.tensor([args.class_id]),
-            base_seed=3407,
+            base_seed=int(sampling.get("base_seed", 3407)),
             num_chunks=dit.num_chunks,
             grid_size=tuple(dit.grid_size),
             channels=dit.in_channels,
-            steps=args.steps,
-            cfg_scale=1.0,
-            internal_guidance_scale=1.78,
-            internal_guidance_t_min=0.10,
-            internal_guidance_t_max=1.0,
+            steps=int(args.steps if args.steps is not None else sampling.get("steps", 10)),
+            cfg_scale=float(sampling.get("cfg_scale", 1.0)),
+            internal_guidance_scale=float(sampling.get("internal_guidance_scale", 1.78)),
+            internal_guidance_t_min=float(sampling.get("internal_guidance_t_min", 0.10)),
+            internal_guidance_t_max=float(sampling.get("internal_guidance_t_max", 1.0)),
             device=device,
         )
 
