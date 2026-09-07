@@ -78,6 +78,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
     trainer = config.get("trainer")
     if task in {"ci2v", "c2v", "ti2v", "t2v"} and trainer not in {None, "libero_videogen"}:
         raise ConfigError("Video generation tasks require trainer=libero_videogen")
+    if task == "ci2va" and trainer not in {None, "fastwam"}:
+        raise ConfigError("CI2VA requires trainer=fastwam")
     model = config.get("model", config)
     if not isinstance(model, Mapping):
         raise ConfigError("model must be a mapping")
@@ -141,6 +143,17 @@ def validate_config(config: Mapping[str, Any]) -> None:
                 decode_frames = ci2v_config.get("sampling", {}).get("decode_frames", num_frames - 1)
                 if int(decode_frames) != num_frames - 1:
                     raise ConfigError("CI2V sampling.decode_frames must equal data.num_frames - 1")
+        if task == "ci2va":
+            if str(data.get("dataset", "")) != "lerobot":
+                raise ConfigError("CI2VA requires data.dataset=lerobot")
+            num_frames = int(data.get("num_frames", 0))
+            if num_frames <= 1 or (num_frames - 1) % 4:
+                raise ConfigError("CI2VA data.num_frames must satisfy (num_frames - 1) % 4 == 0")
+            action_horizon = int(data.get("action_horizon", num_frames - 1))
+            if action_horizon != num_frames - 1:
+                raise ConfigError("CI2VA data.action_horizon must equal data.num_frames - 1")
+            if str(data.get("output_format", "fastwam")) != "fastwam":
+                raise ConfigError("CI2VA data.output_format must be fastwam")
         if int(data.get("frame_interval", 1)) <= 0:
             raise ConfigError("data.frame_interval must be positive")
         if str(data.get("dataset", "")) == "lerobot":

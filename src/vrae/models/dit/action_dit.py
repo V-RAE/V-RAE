@@ -190,8 +190,12 @@ class ActionDiT(nn.Module):
             state["freqs"],
         )
 
-    def post(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self.head(tokens)
+    def post(
+        self,
+        tokens: torch.Tensor,
+        condition: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.head(tokens, condition)
 
     def forward(
         self,

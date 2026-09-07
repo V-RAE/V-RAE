@@ -11,6 +11,7 @@ from vrae.config import ConfigError
 TRAINING_TASKS = {
     "libero_videogen",
     "recon_training",
+    "fastwam",
 }
 
 DEFAULT_DATASET_PATHS = {

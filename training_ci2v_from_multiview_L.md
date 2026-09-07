@@ -7295,3 +7295,117 @@ task=ci2v epoch=430 step=45180 loss=0.361620 loss_full=0.140594 loss_base=0.2210
 task=ci2v epoch=430 step=45200 loss=0.582806 loss_full=0.258286 loss_base=0.324520 ms_per_step=3326.39
 [profile] window=334.74s updates=100 data_wait=1.6ms h2d=0.8ms stage1=193.9ms dit=634.4ms update=27.7ms allocated=29.0GiB reserved=39.6GiB peak=38.0GiB
 task=ci2v epoch=430 step=45220 loss=0.572064 loss_full=0.253118 loss_base=0.318946 ms_per_step=3345.37
+task=ci2v epoch=430 step=45240 loss=0.402890 loss_full=0.162646 loss_base=0.240244 ms_per_step=3771.29
+[epoch-end] epoch=430 elapsed=366.17s step=45255
+[epoch-start] epoch=431 step=45255 steps_per_epoch=105
+task=ci2v epoch=431 step=45260 loss=0.507726 loss_full=0.197918 loss_base=0.309809 ms_per_step=3810.90
+task=ci2v epoch=431 step=45280 loss=0.493881 loss_full=0.207308 loss_base=0.286572 ms_per_step=3777.47
+task=ci2v epoch=431 step=45300 loss=0.506148 loss_full=0.213756 loss_base=0.292392 ms_per_step=3771.69
+[profile] window=369.79s updates=100 data_wait=2.1ms h2d=1.5ms stage1=270.6ms dit=643.9ms update=27.7ms allocated=29.0GiB reserved=39.6GiB peak=38.0GiB
+task=ci2v epoch=431 step=45320 loss=0.502877 loss_full=0.207771 loss_base=0.295106 ms_per_step=3817.62
+task=ci2v epoch=431 step=45340 loss=0.509264 loss_full=0.206663 loss_base=0.302601 ms_per_step=3806.09
+task=ci2v epoch=431 step=45360 loss=0.591114 loss_full=0.248162 loss_base=0.342952 ms_per_step=3764.50
+[epoch-end] epoch=431 elapsed=399.25s step=45360
+[epoch-start] epoch=432 step=45360 steps_per_epoch=105
+task=ci2v epoch=432 step=45380 loss=0.530559 loss_full=0.226504 loss_base=0.304055 ms_per_step=3874.84
+task=ci2v epoch=432 step=45400 loss=0.488191 loss_full=0.196667 loss_base=0.291524 ms_per_step=3882.62
+[profile] window=383.17s updates=100 data_wait=2.1ms h2d=1.7ms stage1=296.6ms dit=651.3ms update=27.8ms allocated=29.0GiB reserved=39.6GiB peak=38.0GiB
+task=ci2v epoch=432 step=45420 loss=0.445333 loss_full=0.183515 loss_base=0.261818 ms_per_step=3791.97
+task=ci2v epoch=432 step=45440 loss=0.483645 loss_full=0.197260 loss_base=0.286384 ms_per_step=4019.14
+task=ci2v epoch=432 step=45460 loss=0.416286 loss_full=0.165027 loss_base=0.251259 ms_per_step=3791.67
+[epoch-end] epoch=432 elapsed=405.68s step=45465
+[epoch-start] epoch=433 step=45465 steps_per_epoch=105
+task=ci2v epoch=433 step=45480 loss=0.393099 loss_full=0.151575 loss_base=0.241524 ms_per_step=4144.62
+task=ci2v epoch=433 step=45500 loss=0.525826 loss_full=0.217332 loss_base=0.308494 ms_per_step=3837.98
+[profile] window=391.96s updates=100 data_wait=2.2ms h2d=1.7ms stage1=310.6ms dit=658.6ms update=29.1ms allocated=29.0GiB reserved=39.6GiB peak=38.0GiB
+task=ci2v epoch=433 step=45520 loss=0.466489 loss_full=0.186512 loss_base=0.279977 ms_per_step=3793.70
+task=ci2v epoch=433 step=45540 loss=0.465131 loss_full=0.189985 loss_base=0.275147 ms_per_step=3615.31
+task=ci2v epoch=433 step=45560 loss=0.484658 loss_full=0.203081 loss_base=0.281577 ms_per_step=3780.35
+[epoch-end] epoch=433 elapsed=402.91s step=45570
+[epoch-start] epoch=434 step=45570 steps_per_epoch=105
+task=ci2v epoch=434 step=45580 loss=0.427030 loss_full=0.172291 loss_base=0.254739 ms_per_step=3847.24
+task=ci2v epoch=434 step=45600 loss=0.493535 loss_full=0.199928 loss_base=0.293607 ms_per_step=3791.67
+[profile] window=376.81s updates=100 data_wait=2.2ms h2d=1.6ms stage1=284.7ms dit=647.4ms update=27.7ms allocated=29.0GiB reserved=39.6GiB peak=38.0GiB
+task=ci2v epoch=434 step=45620 loss=0.586703 loss_full=0.257828 loss_base=0.328875 ms_per_step=3782.89
+task=ci2v epoch=434 step=45640 loss=0.577777 loss_full=0.251575 loss_base=0.326201 ms_per_step=3794.46
+task=ci2v epoch=434 step=45660 loss=0.560267 loss_full=0.237236 loss_base=0.323031 ms_per_step=3804.31
+[epoch-end] epoch=434 elapsed=403.08s step=45675
+[epoch-start] epoch=435 step=45675 steps_per_epoch=105
+task=ci2v epoch=435 step=45680 loss=0.475485 loss_full=0.199766 loss_base=0.275719 ms_per_step=3991.11
+task=ci2v epoch=435 step=45700 loss=0.528371 loss_full=0.223577 loss_base=0.304794 ms_per_step=3812.19
+[profile] window=383.95s updates=100 data_wait=2.1ms h2d=1.9ms stage1=297.9ms dit=651.7ms update=27.7ms allocated=29.0GiB reserved=39.6GiB peak=38.0GiB
+task=ci2v epoch=435 step=45720 loss=0.607529 loss_full=0.262770 loss_base=0.344758 ms_per_step=3798.60
+task=ci2v epoch=435 step=45740 loss=0.581257 loss_full=0.258672 loss_base=0.322585 ms_per_step=3824.96
+task=ci2v epoch=435 step=45760 loss=0.531809 loss_full=0.224404 loss_base=0.307405 ms_per_step=3798.22
+task=ci2v epoch=435 step=45780 loss=0.482674 loss_full=0.206791 loss_base=0.275883 ms_per_step=3754.38
+[epoch-end] epoch=435 elapsed=400.44s step=45780
+[epoch-start] epoch=436 step=45780 steps_per_epoch=105
+task=ci2v epoch=436 step=45800 loss=0.449527 loss_full=0.183480 loss_base=0.266047 ms_per_step=3823.43
+[profile] window=380.24s updates=100 data_wait=2.0ms h2d=1.7ms stage1=291.2ms dit=649.4ms update=27.8ms allocated=29.0GiB reserved=39.6GiB peak=38.0GiB
+task=ci2v epoch=436 step=45820 loss=0.555340 loss_full=0.240086 loss_base=0.315254 ms_per_step=3787.07
+task=ci2v epoch=436 step=45840 loss=0.484173 loss_full=0.198604 loss_base=0.285569 ms_per_step=3871.28
+task=ci2v epoch=436 step=45860 loss=0.446303 loss_full=0.178365 loss_base=0.267938 ms_per_step=3786.09
+task=ci2v epoch=436 step=45880 loss=0.498147 loss_full=0.204511 loss_base=0.293637 ms_per_step=3791.16
+[epoch-end] epoch=436 elapsed=400.07s step=45885
+[epoch-start] epoch=437 step=45885 steps_per_epoch=105
+task=ci2v epoch=437 step=45900 loss=0.428723 loss_full=0.170808 loss_base=0.257915 ms_per_step=3868.38
+[profile] window=382.34s updates=100 data_wait=2.0ms h2d=1.7ms stage1=293.8ms dit=651.3ms update=31.0ms allocated=29.0GiB reserved=39.6GiB peak=38.0GiB
+task=ci2v epoch=437 step=45920 loss=0.449844 loss_full=0.187798 loss_base=0.262046 ms_per_step=3873.89
+task=ci2v epoch=437 step=45940 loss=0.530332 loss_full=0.234546 loss_base=0.295786 ms_per_step=3779.06
+task=ci2v epoch=437 step=45960 loss=0.541338 loss_full=0.232353 loss_base=0.308985 ms_per_step=3797.69
+task=ci2v epoch=437 step=45980 loss=0.451607 loss_full=0.181694 loss_base=0.269913 ms_per_step=3812.59
+[epoch-end] epoch=437 elapsed=402.31s step=45990
+[epoch-start] epoch=438 step=45990 steps_per_epoch=105
+task=ci2v epoch=438 step=46000 loss=0.471267 loss_full=0.194679 loss_base=0.276588 ms_per_step=3800.00
+[profile] window=381.52s updates=100 data_wait=2.2ms h2d=1.7ms stage1=291.2ms dit=651.7ms update=31.1ms allocated=29.0GiB reserved=39.6GiB peak=38.0GiB
+wandb: Encoding video...
+wandb: Encoding video...
+wandb: Encoding video...
+wandb: Encoding video...
+wandb: Encoding video...
+wandb: Encoding video...
+wandb: Encoding video...
+wandb: Encoding video...
+[sample] step=46000 elapsed=2.53s
+[checkpoint] step=46000 elapsed=37.25s
+task=ci2v epoch=438 step=46020 loss=0.429959 loss_full=0.181100 loss_base=0.248859 ms_per_step=3855.17
+task=ci2v epoch=438 step=46040 loss=0.415543 loss_full=0.163284 loss_base=0.252259 ms_per_step=3864.65
+task=ci2v epoch=438 step=46060 loss=0.547611 loss_full=0.238320 loss_base=0.309291 ms_per_step=3792.55
+task=ci2v epoch=438 step=46080 loss=0.596156 loss_full=0.276378 loss_base=0.319777 ms_per_step=3786.37
+[epoch-end] epoch=438 elapsed=440.65s step=46095
+[epoch-start] epoch=439 step=46095 steps_per_epoch=105
+task=ci2v epoch=439 step=46100 loss=0.446284 loss_full=0.181088 loss_base=0.265196 ms_per_step=3810.48
+[profile] window=382.43s updates=100 data_wait=1.9ms h2d=1.7ms stage1=294.6ms dit=651.6ms update=27.7ms allocated=29.0GiB reserved=39.6GiB peak=38.0GiB
+task=ci2v epoch=439 step=46120 loss=0.542682 loss_full=0.230185 loss_base=0.312497 ms_per_step=3838.73
+task=ci2v epoch=439 step=46140 loss=0.520880 loss_full=0.228332 loss_base=0.292548 ms_per_step=3808.94
+task=ci2v epoch=439 step=46160 loss=0.521792 loss_full=0.223641 loss_base=0.298151 ms_per_step=3819.70
+task=ci2v epoch=439 step=46180 loss=0.493744 loss_full=0.202776 loss_base=0.290968 ms_per_step=3815.03
+task=ci2v epoch=439 step=46200 loss=0.427626 loss_full=0.174895 loss_base=0.252731 ms_per_step=3802.40
+[profile] window=381.94s updates=100 data_wait=1.2ms h2d=1.7ms stage1=298.2ms dit=647.9ms update=27.8ms allocated=29.0GiB reserved=39.6GiB peak=38.0GiB
+[epoch-end] epoch=439 elapsed=402.02s step=46200
+[epoch-start] epoch=440 step=46200 steps_per_epoch=105
+task=ci2v epoch=440 step=46220 loss=0.495942 loss_full=0.196469 loss_base=0.299473 ms_per_step=3895.81
+W0907 11:20:31.316000 34878 site-packages/torch/distributed/elastic/agent/server/api.py:739] Received Signals.SIGTERM death signal, shutting down workers
+W0907 11:20:31.336000 34878 site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 34953 closing signal SIGTERM
+Traceback (most recent call last):
+  File "/zsh/miniconda3/envs/vrae/bin/torchrun", line 6, in <module>
+    sys.exit(main())
+  File "/zsh/miniconda3/envs/vrae/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+  File "/zsh/miniconda3/envs/vrae/lib/python3.10/site-packages/torch/distributed/run.py", line 991, in main
+    run(args)
+  File "/zsh/miniconda3/envs/vrae/lib/python3.10/site-packages/torch/distributed/run.py", line 982, in run
+    elastic_launch(
+  File "/zsh/miniconda3/envs/vrae/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/zsh/miniconda3/envs/vrae/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 308, in launch_agent
+    result = agent.run()
+  File "/zsh/miniconda3/envs/vrae/lib/python3.10/site-packages/torch/distributed/elastic/metrics/api.py", line 134, in wrapper
+    result = f(*args, **kwargs)
+  File "/zsh/miniconda3/envs/vrae/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 731, in run
+    result = self._invoke_run(role)
+  File "/zsh/miniconda3/envs/vrae/lib/python3.10/site-packages/torch/distributed/elastic/agent/server/api.py", line 908, in _invoke_run
+    time.sleep(monitor_interval)
+  File "/zsh/miniconda3/envs/vrae/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/api.py", line 86, in _terminate_process_handler
+    raise SignalException(f"Process {os.getpid()} got signal: {sigval}", sigval=sigval)
+torch.distributed.elastic.multiprocessing.api.SignalException: Process 34878 got signal: 15

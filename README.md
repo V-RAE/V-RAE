@@ -125,6 +125,46 @@ python sampling.py \
 
 默认输出到 checkpoint run 的 `samples/`，包括 `samples.pt`、每个 sample/view 的 MP4 和 `sampling_metadata.json`。当前多视角输出张量为 `[B,T,V,C,H,W]`，每个视角单独写入一个视频。
 
+## FastWAM MoT：LIBERO ci2va
+
+`configs/training/generation/libero_ci2va_mot.yaml` 使用同一个 LeRobot v3 数据集，按
+`1 + 20` 帧构造 image-conditioned video/action joint batch：两路相机横向拼接为
+`[C,T,H,2W]`，动作序列为 20 步，并附带 episode padding mask。Wan2.2 的重量级组件由
+FastWAM 仓库提供，本仓库负责数据适配、配置校验和训练循环。
+
+先在环境中安装 FastWAM，并设置其源码目录，然后只检查配置：
+
+```bash
+FASTWAM_ROOT=/path/to/FastWAM \
+  scripts/train/libero_fastwam.sh 1 1 0 --build-only
+```
+
+正式训练需要 Wan2.2、ActionDiT backbone 和对应 VAE/text 资源；数据路径可通过
+`configs/paths.local.yaml` 的 `datasets.lerobot` 覆盖：
+
+配置默认使用 FastWAM 的 T5 embedding cache（`data/text_embeds_cache/libero`）。先按
+FastWAM 仓库的 `scripts/precompute_text_embeds.py` 生成这些缓存，或将
+`data.text_embedding_cache_dir` 改为已有缓存目录。
+
+```bash
+FASTWAM_ROOT=/path/to/FastWAM \
+  scripts/train/libero_fastwam.sh 1 1 0
+```
+
+生产训练入口固定调用官方 `fastwam.runtime:create_fastwam_joint`。仓库内的
+`vrae.models.dit.fastwam.FastWAM` 只保留为组件注入式实验 adapter，不从
+`vrae.models.dit` 聚合导出，也不用于生产配置。
+
+恢复训练时将 `training.resume` 设置为 step checkpoint 或 `latest.json`。`max_steps`
+始终表示全程目标 step；恢复会加载模型、optimizer 和 step，但从新的 shuffle epoch
+开始，不保证逐 batch 复现。每次保存只生成一个 `step-XXXXXXXX.pt`，同目录的
+`latest.json` 是小型指针文件。默认每 20 step 输出 data wait、VAE encode、MoT
+forward、backward 和 optimizer 耗时。
+
+默认每 5000 step 由 rank 0 对四个固定样本执行联合采样，宽度拼接的 MP4 和预测/真值
+轨迹 PNG 保存在 `outputs/fastwam_samples/${run_name}`，并上传相同文件到 WandB。
+WandB 凭据只从环境变量或本机登录读取。
+
 ## 目录
 
 ```text
@@ -132,8 +172,10 @@ src/vrae/models/dit/                    class-conditional VideoDiT 与 flow tran
 src/vrae/data/                          LeRobot episode/clip 数据集
 src/vrae/training/recon_training/       Stage 1 重建训练
 src/vrae/training/libero_videogen/      Stage 2 LIBERO 生成入口
+src/vrae/training/fastwam/              FastWAM MoT ci2va 训练入口
 configs/data/libero.yaml                数据、相机和 40 类映射
 configs/training/reconstruction/       重建训练配置
 configs/training/generation/           VideoDiT 生成训练配置
+configs/training/generation/libero_ci2va_mot.yaml  FastWAM ci2va 配置
 configs/training/common/               重建/生成共用训练基础配置
 ```

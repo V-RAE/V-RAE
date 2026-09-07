@@ -1,10 +1,8 @@
-"""FastWAM video/action world-model wrapper.
+"""Experimental FastWAM video/action adapter.
 
-The wrapper is deliberately loader-agnostic.  A Wan-compatible video expert,
-VAE, and (optionally) text stack are injected by the caller; this repository has
-no FastWAM-specific checkpoint loader.  The denoising core is nevertheless the
-same one used by Wan22: prepare both streams, mix only the video encoder layers
-through :class:`MoT`, and project each stream back to its data space.
+Production training uses ``fastwam.runtime:create_fastwam_joint`` from the
+official FastWAM repository. This loader-agnostic adapter is retained only for
+tests and experiments that inject all Wan-compatible components explicitly.
 """
 
 from __future__ import annotations
@@ -104,7 +102,7 @@ class WanContinuousFlowMatchScheduler:
 
 
 class FastWAM(nn.Module):
-    """World model containing video and action experts joined by MoT."""
+    """Experimental component-injected video/action world-model adapter."""
 
     def __init__(
         self,
@@ -162,7 +160,7 @@ class FastWAM(nn.Module):
         self.to(device=self.device, dtype=torch_dtype)
 
     @classmethod
-    def from_wan22_pretrained(
+    def from_components(
         cls,
         *,
         video_expert: nn.Module | None = None,
@@ -369,7 +367,7 @@ class FastWAM(nn.Module):
         ) = video_prepared[:10]
         (
             action_tokens,
-            _action_t,
+            action_t,
             action_t_mod,
             action_context,
             action_context_mask,
@@ -389,7 +387,7 @@ class FastWAM(nn.Module):
             attention_mask,
         )
         video_output = self.video_expert.post(video_tokens, video_t, f_video, h_video, w_video)
-        return video_output, self.action_expert.post(action_tokens)
+        return video_output, self.action_expert.post(action_tokens, action_t)
 
     @torch.no_grad()
     def _denoise_action_with_video_cache(
@@ -406,7 +404,7 @@ class FastWAM(nn.Module):
 
         (
             action_tokens,
-            _t,
+            action_t,
             action_t_mod,
             action_context,
             action_context_mask,
@@ -422,7 +420,7 @@ class FastWAM(nn.Module):
             video_cache_v,
             action_attention_mask,
         )
-        return self.action_expert.post(action_tokens)
+        return self.action_expert.post(action_tokens, action_t)
 
     def training_loss(self, sample: Mapping[str, Any]) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute weighted video/action flow-matching losses from a sample."""
@@ -439,6 +437,12 @@ class FastWAM(nn.Module):
         noise_action = torch.randn_like(action)
         noisy_video = self.train_video_scheduler.add_noise(video, noise_video, t_video)
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, t_action)
+        include_initial_video_step = True
+        if inputs["fuse_vae_embedding_in_latents"]:
+            # CI2VA keeps the first image latent clean while predicting the
+            # remaining four-frame latent groups.
+            noisy_video[:, :, :1] = video[:, :, :1]
+            include_initial_video_step = False
         video_seq_len, tokens_per_frame = self._video_token_layout(noisy_video)
         attention_mask = self._build_mot_attention_mask(
             video_seq_len, noisy_action.shape[1], tokens_per_frame, noisy_video.device
@@ -455,9 +459,23 @@ class FastWAM(nn.Module):
             action_condition=action,
         )
         target_video = self.train_video_scheduler.training_target(video, noise_video, t_video)
+        if not include_initial_video_step:
+            pred_video = pred_video[:, :, 1:]
+            target_video = target_video[:, :, 1:]
         target_action = self.train_action_scheduler.training_target(action, noise_action, t_action)
         loss_video = F.mse_loss(pred_video.float(), target_video.float())
-        loss_action = F.mse_loss(pred_action.float(), target_action.float())
+        action_loss = F.mse_loss(
+            pred_action.float(), target_action.float(), reduction="none"
+        ).mean(dim=-1)
+        action_is_pad = inputs["action_is_pad"]
+        if action_is_pad is not None:
+            valid = (~action_is_pad.to(device=action_loss.device, dtype=torch.bool)).to(
+                dtype=action_loss.dtype
+            )
+            valid_count = valid.sum(dim=1).clamp_min(1.0)
+            loss_action = (action_loss * valid).sum(dim=1).div(valid_count).mean()
+        else:
+            loss_action = action_loss.mean()
         loss_video = loss_video * self.train_video_scheduler.training_weight(t_video).mean().to(loss_video)
         loss_action = loss_action * self.train_action_scheduler.training_weight(t_action).mean().to(loss_action)
         total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
