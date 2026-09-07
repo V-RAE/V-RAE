@@ -60,6 +60,28 @@ def validate_build(config: dict[str, Any]) -> dict[str, Any]:
     factory = model.get("factory")
     if not factory:
         raise ValueError("model.factory is required")
+    factory_kwargs = model.get("factory_kwargs", {})
+    if not isinstance(factory_kwargs, dict):
+        raise ValueError("model.factory_kwargs must be a mapping")
+    video_dit_config = factory_kwargs.get("video_dit_config", {})
+    loss_config = factory_kwargs.get("loss", {})
+    if not isinstance(video_dit_config, dict) or not isinstance(loss_config, dict):
+        raise ValueError("model.factory_kwargs.video_dit_config and loss must be mappings")
+    base_model_depth = video_dit_config.get("base_model_depth")
+    base_model_coeff = float(loss_config.get("base_model_coeff", 0.0))
+    if base_model_coeff < 0:
+        raise ValueError("model.factory_kwargs.loss.base_model_coeff must be non-negative")
+    if base_model_depth is not None:
+        num_layers = int(video_dit_config.get("num_layers", 0))
+        if not 1 <= int(base_model_depth) <= num_layers:
+            raise ValueError("video_dit_config.base_model_depth must be within num_layers")
+    if base_model_coeff > 0 and base_model_depth is None:
+        raise ValueError(
+            "base_model_coeff > 0 requires video_dit_config.base_model_depth"
+        )
+    training = config.get("training", {})
+    if training.get("resume") and training.get("init_from"):
+        raise ValueError("training.resume and training.init_from are mutually exclusive")
     cameras = data.get("camera_keys")
     if not isinstance(cameras, list) or not cameras:
         raise ValueError("data.camera_keys must be a non-empty list")
@@ -90,6 +112,16 @@ def validate_build(config: dict[str, Any]) -> dict[str, Any]:
         "action_horizon": action_horizon,
         "num_cameras": len(cameras),
         "model_factory": str(factory),
+        "base_model_depth": base_model_depth,
+        "base_model_coeff": base_model_coeff,
+        "checkpoint_mode": (
+            "resume"
+            if training.get("resume")
+            else "init_from"
+            if training.get("init_from")
+            else "fresh"
+        ),
+        "wandb_enabled": bool(config.get("wandb", {}).get("enabled", True)),
     }
 
 
@@ -142,13 +174,21 @@ def _save_checkpoint(
     optimizer: torch.optim.Optimizer,
     run: Path,
     step: int,
+    training_state: dict[str, Any] | None = None,
 ) -> Path:
     run.joinpath("checkpoints").mkdir(parents=True, exist_ok=True)
     unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
     path = run / "checkpoints" / f"step-{step:08d}.pt"
+    temporary = path.with_suffix(".pt.tmp")
     if not hasattr(unwrapped, "save_checkpoint"):
         raise TypeError("FastWAM model must provide save_checkpoint(path, optimizer, step)")
-    unwrapped.save_checkpoint(str(path), optimizer=optimizer, step=step)
+    unwrapped.save_checkpoint(
+        str(temporary),
+        optimizer=optimizer,
+        step=step,
+        training_state=training_state,
+    )
+    temporary.replace(path)
     latest = run / "checkpoints" / "latest.json"
     temporary = latest.with_suffix(".json.tmp")
     temporary.write_text(
@@ -187,6 +227,50 @@ def _load_checkpoint(
     if payload.get("step") is None:
         raise ValueError("FastWAM resume checkpoint must contain `step`")
     return int(payload["step"])
+
+
+def _load_weights(model: nn.Module, path: Path) -> int | None:
+    if not hasattr(model, "load_checkpoint"):
+        raise TypeError("FastWAM model must provide load_checkpoint(path, optimizer=None)")
+    payload = model.load_checkpoint(str(path), optimizer=None)
+    if not isinstance(payload, dict) or "mot" not in payload:
+        raise ValueError("FastWAM init_from checkpoint must contain `mot`")
+    step = payload.get("step")
+    return None if step is None else int(step)
+
+
+def _prepare_trainable_parameters(model: nn.Module) -> list[nn.Parameter]:
+    model.eval()
+    model.requires_grad_(False)
+    model.dit.train()
+    model.dit.requires_grad_(True)
+    trainable = list(model.dit.parameters())
+    proprio_encoder = getattr(model, "proprio_encoder", None)
+    if proprio_encoder is not None:
+        proprio_encoder.train()
+        proprio_encoder.requires_grad_(True)
+        trainable.extend(proprio_encoder.parameters())
+    return trainable
+
+
+def _loss_values_for_logging(
+    loss: torch.Tensor,
+    metrics: dict[str, Any],
+) -> torch.Tensor:
+    def scalar(name: str, fallback: object) -> torch.Tensor:
+        value = metrics.get(name, fallback)
+        if isinstance(value, torch.Tensor):
+            return value.detach().to(device=loss.device, dtype=torch.float32).reshape(())
+        return torch.as_tensor(value, device=loss.device, dtype=torch.float32).reshape(())
+
+    return torch.stack(
+        (
+            loss.detach().float(),
+            scalar("loss_video_full", metrics.get("loss_video", 0.0)),
+            scalar("loss_video_base", 0.0),
+            scalar("loss_action", 0.0),
+        )
+    )
 
 
 def _format_timings(values: dict[str, float]) -> str:
@@ -228,18 +312,7 @@ def train(config: dict[str, Any], paths, run: Path, max_steps: int | None) -> No
         **loader_options,
     )
     model = _build_model(config, context.device)
-    trainable = (
-        list(model.dit.parameters())
-        if hasattr(model, "dit")
-        else list(model.parameters())
-    )
-    proprio_encoder = getattr(model, "proprio_encoder", None)
-    if proprio_encoder is not None and not any(
-        parameter is item
-        for parameter in trainable
-        for item in proprio_encoder.parameters()
-    ):
-        trainable.extend(proprio_encoder.parameters())
+    trainable = _prepare_trainable_parameters(model)
     optimizer = torch.optim.AdamW(
         trainable,
         lr=float(config["training"]["optimizer"].get("lr", 1.0e-4)),
@@ -247,14 +320,37 @@ def train(config: dict[str, Any], paths, run: Path, max_steps: int | None) -> No
         betas=tuple(config["training"]["optimizer"].get("betas", [0.9, 0.95])),
     )
     step = 0
+    initialization: dict[str, Any] | None = None
     resume = config["training"].get("resume")
+    init_from = config["training"].get("init_from")
+    if resume and init_from:
+        raise ValueError("training.resume and training.init_from are mutually exclusive")
     if resume:
         resume_path = _resolve_resume_path(str(resume), paths.project_root)
         step = _load_checkpoint(model, optimizer, resume_path)
+        initialization = {
+            "mode": "resume",
+            "checkpoint": str(resume_path),
+            "source_step": step,
+        }
         if context.is_main:
             print(
                 f"Resumed FastWAM checkpoint path={resume_path} step={step}; "
                 "starting a new shuffled data epoch.",
+                flush=True,
+            )
+    elif init_from:
+        init_path = _resolve_resume_path(str(init_from), paths.project_root)
+        source_step = _load_weights(model, init_path)
+        initialization = {
+            "mode": "init_from",
+            "checkpoint": str(init_path),
+            "source_step": source_step,
+        }
+        if context.is_main:
+            print(
+                f"Initialized FastWAM weights path={init_path} "
+                f"source_step={source_step}; optimizer and training step start fresh.",
                 flush=True,
             )
     profiler = StepProfiler(
@@ -273,11 +369,17 @@ def train(config: dict[str, Any], paths, run: Path, max_steps: int | None) -> No
     autocast_dtype = _torch_dtype(precision)
     target_steps = _target_steps(config, max_steps, len(loader))
     run.mkdir(parents=True, exist_ok=True)
+    run_config = dict(config)
+    if initialization is not None:
+        run_config["initialization"] = initialization
     if context.is_main:
-        save_resolved_config(config, run / "resolved_config.yaml")
+        save_resolved_config(run_config, run / "resolved_config.yaml")
         run.joinpath("checkpoints").mkdir(exist_ok=True)
+        build_report = validate_build(config)
+        if initialization is not None:
+            build_report["initialization"] = initialization
         (run / "build.json").write_text(
-            json.dumps(validate_build(config), indent=2) + "\n",
+            json.dumps(build_report, indent=2) + "\n",
             encoding="utf-8",
         )
     sampling_config = dict(config.get("sampling", {}))
@@ -303,13 +405,9 @@ def train(config: dict[str, Any], paths, run: Path, max_steps: int | None) -> No
     wandb_config = bind_wandb_run_name(config.get("wandb", {}), str(config["run_name"]))
     wandb_logger = WandbLogger(
         wandb_config,
-        enabled=(
-            context.is_main
-            and sampling_enabled
-            and bool(sampling_config.get("upload_wandb", True))
-        ),
+        enabled=context.is_main and bool(wandb_config.get("enabled", True)),
         run_dir=str(run),
-        run_config=config,
+        run_config=run_config,
     )
     batches_per_epoch = max(len(loader), 1)
     start_epoch = math.ceil(step / batches_per_epoch)
@@ -319,12 +417,12 @@ def train(config: dict[str, Any], paths, run: Path, max_steps: int | None) -> No
     checkpoint_interval = int(config["training"].get("checkpoint_interval", 5000))
     last_checkpoint_step: int | None = None
     initial_step = step
+    training_state = {"epoch": start_epoch, "batch_in_epoch": 0}
     previous_step_finished_at = time.perf_counter()
     for epoch in range(start_epoch, stop_epoch):
         if sampler is not None:
             sampler.set_epoch(epoch)
-        model.train()
-        for batch in loader:
+        for batch_index, batch in enumerate(loader):
             step_started_at = previous_step_finished_at
             batch_ready_at = time.perf_counter()
             profiler.record_wall(
@@ -337,7 +435,7 @@ def train(config: dict[str, Any], paths, run: Path, max_steps: int | None) -> No
                     dtype=autocast_dtype,
                     enabled=autocast_enabled,
                 ):
-                    loss, metrics = model.training_loss(batch)
+                    loss, metrics = model(batch)
             with profiler.phase("backward_ms"):
                 loss.backward()
             clip_grad = float(config["training"].get("clip_grad", 1.0))
@@ -347,13 +445,23 @@ def train(config: dict[str, Any], paths, run: Path, max_steps: int | None) -> No
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             step += 1
+            training_state = {
+                "epoch": epoch,
+                "batch_in_epoch": batch_index + 1,
+            }
             previous_step_finished_at = time.perf_counter()
             profiler.record_wall(
                 "step_ms",
                 (previous_step_finished_at - step_started_at) * 1000.0,
             )
             if step % log_interval == 0:
-                reduced = reduce_mean(loss.detach())
+                reduced = reduce_mean(_loss_values_for_logging(loss, metrics))
+                (
+                    reduced_loss,
+                    reduced_video_full,
+                    reduced_video_base,
+                    reduced_action,
+                ) = reduced.tolist()
                 timings = profiler.averages()
                 if context.is_main:
                     if "forward_ms" in timings:
@@ -370,13 +478,19 @@ def train(config: dict[str, Any], paths, run: Path, max_steps: int | None) -> No
                             / timings["step_ms"]
                         )
                     print(
-                        f"task=ci2va step={step} loss={float(reduced):.6f} {metrics} "
+                        f"task=ci2va step={step} loss={reduced_loss:.6f} "
+                        f"loss_video_full={reduced_video_full:.6f} "
+                        f"loss_video_base={reduced_video_base:.6f} "
+                        f"loss_action={reduced_action:.6f} "
                         f"{_format_timings(timings)}",
                         flush=True,
                     )
                     wandb_logger.log(
                         {
-                            "train/loss": float(reduced),
+                            "train/loss": reduced_loss,
+                            "train/loss_video_full": reduced_video_full,
+                            "train/loss_video_base": reduced_video_base,
+                            "train/loss_action": reduced_action,
                             **{f"timing/{name}": value for name, value in timings.items()},
                         },
                         step=step,
@@ -385,7 +499,13 @@ def train(config: dict[str, Any], paths, run: Path, max_steps: int | None) -> No
                 barrier()
                 checkpoint_started_at = time.perf_counter()
                 if context.is_main:
-                    _save_checkpoint(model, optimizer, run, step)
+                    _save_checkpoint(
+                        model,
+                        optimizer,
+                        run,
+                        step,
+                        training_state=training_state,
+                    )
                 barrier()
                 checkpoint_ms = (time.perf_counter() - checkpoint_started_at) * 1000.0
                 profiler.record_wall("checkpoint_ms", checkpoint_ms)
@@ -433,7 +553,13 @@ def train(config: dict[str, Any], paths, run: Path, max_steps: int | None) -> No
     if step > initial_step and step != last_checkpoint_step:
         barrier()
         if context.is_main:
-            _save_checkpoint(model, optimizer, run, step)
+            _save_checkpoint(
+                model,
+                optimizer,
+                run,
+                step,
+                training_state=training_state,
+            )
         barrier()
     wandb_logger.finish()
 
