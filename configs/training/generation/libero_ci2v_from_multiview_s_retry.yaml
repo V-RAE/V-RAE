@@ -1,0 +1,4 @@
+include:
+  - libero_ci2v_from_multiview_s.yaml
+
+run_name: vjepa2_1_libero_ci2v_from_multiview_s_bs16_nogc

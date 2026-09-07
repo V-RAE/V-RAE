@@ -320,6 +320,7 @@ class VRAEVideoDiT(nn.Module):
         condition_drop_mask: torch.Tensor | None,
         class_drop_mask: torch.Tensor | None,
         stream_ids: torch.Tensor | None,
+        clean_mask: torch.Tensor | None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -356,12 +357,38 @@ class VRAEVideoDiT(nn.Module):
         if condition_drop_mask is not None and class_drop_mask is not None:
             raise ValueError("pass only one of condition_drop_mask or class_drop_mask")
         batch_size = noisy.shape[0]
+        if clean_mask is None:
+            clean_mask = torch.zeros(
+                batch_size, self.num_chunks, dtype=torch.bool, device=noisy.device
+            )
+        else:
+            clean_mask = torch.as_tensor(clean_mask, device=noisy.device, dtype=torch.bool)
+            if clean_mask.shape != (batch_size, self.num_chunks):
+                raise ValueError(
+                    f"clean_mask must have shape [{batch_size},{self.num_chunks}], "
+                    f"got {tuple(clean_mask.shape)}"
+                )
         if time.ndim == 0:
             time = time.expand(batch_size)
-        if time.ndim != 1 or time.shape[0] != batch_size:
-            raise ValueError(f"time must have shape [{batch_size}], got {tuple(time.shape)}")
-        if labels.shape != (batch_size,):
-            raise ValueError(f"labels must have shape [{batch_size}], got {tuple(labels.shape)}")
+        if time.ndim == 1:
+            if time.shape[0] != batch_size:
+                raise ValueError(f"time must have shape [{batch_size}]")
+            chunk_time = time[:, None].expand(batch_size, self.num_chunks).clone()
+            chunk_time = chunk_time.masked_fill(clean_mask, 0)
+        elif time.ndim == 2:
+            if time.shape != (batch_size, self.num_chunks):
+                raise ValueError(
+                    f"time must have shape [{batch_size},{self.num_chunks}]"
+                )
+            chunk_time = time
+        else:
+            raise ValueError(
+                f"time must have shape [{batch_size}] or [{batch_size},{self.num_chunks}]"
+            )
+        if labels.ndim != 1 or labels.shape[0] != batch_size:
+            raise ValueError(
+                f"labels must have shape [{batch_size}], got {tuple(labels.shape)}"
+            )
         if self.multiview_enabled:
             if stream_ids is None:
                 stream_ids = torch.arange(self.num_views, device=noisy.device).expand(
@@ -376,7 +403,17 @@ class VRAEVideoDiT(nn.Module):
             if class_drop_mask is not None
             else condition_drop_mask
         )
-        return noisy, time, labels, drop_mask, stream_ids
+        if drop_mask is not None:
+            drop_mask = torch.as_tensor(
+                drop_mask,
+                device=noisy.device,
+                dtype=torch.bool,
+            )
+            if drop_mask.ndim != 1 or drop_mask.shape[0] != batch_size:
+                raise ValueError(
+                    f"drop_mask must have shape [{batch_size}], got {tuple(drop_mask.shape)}"
+                )
+        return noisy, chunk_time, labels, drop_mask, stream_ids
 
     @staticmethod
     def _expand_view_freqs(freqs: torch.Tensor, *, chunks: int, patches: int, views: int) -> torch.Tensor:
@@ -456,6 +493,7 @@ class VRAEVideoDiT(nn.Module):
         class_drop_mask: torch.Tensor | None = None,
         condition_generator: torch.Generator | None = None,
         stream_ids: torch.Tensor | None = None,
+        clean_mask: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         int,
@@ -467,7 +505,7 @@ class VRAEVideoDiT(nn.Module):
         torch.Tensor,
     ]:
         """Prepare validated inputs for the VideoDiT tensor core."""
-        noisy, time, labels, drop_mask, stream_ids = self._validate_forward_inputs(
+        noisy, chunk_time, labels, drop_mask, stream_ids = self._validate_forward_inputs(
             noisy,
             time,
             labels,
@@ -475,17 +513,24 @@ class VRAEVideoDiT(nn.Module):
             condition_drop_mask,
             class_drop_mask,
             stream_ids,
+            clean_mask,
         )
         grid, batch_size, views = self._prepare_input_grid(noisy)
-        time_embedding = self.time_embedder(time.to(noisy.device))
+        time_embedding = self.time_embedder(chunk_time.to(noisy.device))
         label_embedding, _, _ = self.condition_adapter.prepare(
             labels,
             drop_mask=drop_mask,
             generator=condition_generator,
         )
-        encoder_condition = time_embedding + label_embedding.to(
-            time_embedding.dtype
-        )
+        label_embedding = label_embedding.expand(batch_size, self.num_chunks, -1)
+        encoder_condition = time_embedding + label_embedding.to(time_embedding.dtype)
+        token_count = views * self.patches_per_chunk
+        time_embedding = time_embedding[:, :, None, :].expand(
+            batch_size, self.num_chunks, token_count, -1
+        ).reshape(batch_size, self.num_chunks * token_count, -1)
+        encoder_condition = encoder_condition[:, :, None, :].expand(
+            batch_size, self.num_chunks, token_count, -1
+        ).reshape(batch_size, self.num_chunks * token_count, -1)
         encoder_freqs = self._expand_view_freqs(
             self.encoder_rope(self.num_chunks, self.patch_grid[0], self.patch_grid[1]),
             chunks=self.num_chunks,
@@ -600,6 +645,7 @@ class VRAEVideoDiT(nn.Module):
         class_drop_mask: torch.Tensor | None = None,
         condition_generator: torch.Generator | None = None,
         stream_ids: torch.Tensor | None = None,
+        clean_mask: torch.Tensor | None = None,
         return_base: bool = False,
         return_intermediate: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[Any, torch.Tensor]:
@@ -612,6 +658,7 @@ class VRAEVideoDiT(nn.Module):
             class_drop_mask=class_drop_mask,
             condition_generator=condition_generator,
             stream_ids=stream_ids,
+            clean_mask=clean_mask,
         )
         full_tokens, base_tokens, base_sequence = self._forward_core(*prepared)
         return self.post(

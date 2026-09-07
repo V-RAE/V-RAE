@@ -85,7 +85,6 @@ task_config:
       multiview: true
       pooling: same_as_target
       temporal_lift: repeat_to_four_frames
-      dropout: 0.10
     video_target:
       frames: 20
       frame_interval: 1
@@ -96,35 +95,33 @@ task_config:
   t2v: {status: reserved, condition: [text]}
 
 data:
-  condition_frames: 1
-  target_frames: 20
-  read_frames: 21       # 由 condition_frames + target_frames 校验
+  num_frames: 21        # CI2V 总读取帧数：1 个首帧 condition + 20 个 target
   frame_interval: 1
 
 dit:
+  name: vrae_video_dit
   image_condition: true
   image_condition_injection: temporal_concat
   class_dropout: 0.10
-  image_dropout: 0.10
 
 latent_normalizer:
   path: ckpts/libero_videogen/latent_stats/ci2v_shared_20f_multiview.pt
 ```
 
-校验规则：`read_frames=21`、`target_frames=20`、`latent_frames=5`、`decode_frames=20`，并确保 `target_frames` 能被 `encoder_tubelet * pool_group = 4` 整除。
+校验规则：CI2V 使用 `data.num_frames=21` 作为总读取帧数，拆分为 1 个首帧 condition 和 20 个 target；`latent_frames=5`、`decode_frames=20`，并确保 target 帧数能被 `encoder_tubelet * pool_group = 4` 整除。
 
 ## 4. 数据加载
 
-新增 CI2V 数据模式，加载同一 episode、同一时间起点的 21 帧：
+CI2V 直接复用 `src/vrae/data/reconstruction.py` 的 `LiberoVideoDataset`，复用原有配置和采样逻辑，加载同一 episode、同一时间起点的 21 帧。只在原数据集样本返回值上增加 CI2V 所需字段，不新增 dataset 专用配置：
 
-1. 所有 camera 使用同一组 source-frame indices；
-2. `video[0:1]` 保存为 `image_condition`；
-3. `video[1:21]` 保存为 `video_target`；
-4. 返回 `condition_frame_indices`、`target_frame_indices`、`label` 和 `stream_ids`；
+1. 继续使用现有 `data.num_frames`；CI2V 要求其为 21，`LiberoVideoDataset` 读取完整 21 帧；
+2. 所有 camera 使用同一组 source-frame indices；
+3. `video[0:1]` 对应 condition，`video[1:]` 对应 target；数据集只新增对应的 indices 和 `clean_mask` 字段，不复制视频张量；
+4. 增加 `condition_frame_indices`、`target_frame_indices`，保留原有 `label` 和 `stream_ids`；
 5. episode 不足 21 帧时拒绝该样本，不能跨 episode 补帧；
 6. 复用现有 `camera_keys`、resize、center crop 和 class-id 映射。
 
-数据 collator/bounded loader 需要同时搬运 `image_condition` 和原始首帧，保证 pinned-memory 和 H2D 行为一致。
+数据 collator/bounded loader 只搬运原始 `video` 与新增 indices，训练侧根据首帧/目标帧切片，避免复制两份视频张量；pinned-memory 和 H2D 行为保持一致。
 
 ## 5. V-JEPA 与 shared latent normalizer
 
@@ -169,7 +166,31 @@ normalize(stage1.encode(...), shared_normalizer)
 
 但只有 target latent 进入 flow matching；image latent 始终是 clean condition。
 
-## 6. DiT：最小时间拼接改造
+## 6. DiT：`VRAEVideoDiT` 原生支持 c2v/ci2v
+
+不新增 CI2V 专用 DiT 类，直接扩展现有 `src/vrae/models/dit/video_dit.py` 中的 `VRAEVideoDiT`。c2v 和 ci2v 共用同一套 latent embedding、attention/MLP blocks、AdaLN、RoPE、view embedding、输出层和权重初始化。
+
+调用方负责把 clean condition 和 noisy target 沿时间维拼接好，`forward` 只接收统一序列和一个显式的 clean/noisy mask：
+
+```python
+def forward(
+    self,
+    sequence,
+    time,
+    labels=None,
+    *,
+    clean_mask=None,
+    ...,
+):
+    ...
+```
+
+其中：
+
+- c2v：`sequence=[B,4,V,N,C]`，`clean_mask` 缺省或为 `[B,4]` 全 `False`；
+- ci2v：调用方先拼接 `image_clean=[B,1,V,N,C]` 和 `target_noisy=[B,5,V,N,C]`，得到 `sequence=[B,6,V,N,C]`；
+- ci2v 的 `clean_mask=[B,6]` 为 `[True,False,False,False,False,False]`；
+- `clean_mask=True` 表示该 chunk 是 clean，`False` 表示该 chunk 是 noisy/target。
 
 不增加以下结构：
 
@@ -179,54 +200,96 @@ normalize(stage1.encode(...), shared_normalizer)
 - image adapter；
 - 额外 gate。
 
-使用现有 `FramePatchEmbed`、attention、MLP、AdaLN 和 view/spatial 处理。DiT 内部执行：
+使用现有 `FramePatchEmbed`、attention、MLP、AdaLN 和 view/spatial 处理。统一的 `VRAEVideoDiT` 内部只负责验证 mask、编码统一序列并执行 DiT blocks：
 
 ```text
-image_clean  [B,1,V,N,C]
-target_noisy [B,5,V,N,C]
-             concat(dim=1)
-             -> [B,6,V,N,C]
+sequence [B,T,V,N,C]
+    -> FramePatchEmbed
+    -> view embedding
+    -> self-attention / AdaLN / MLP
+    -> output [B,T,V,N,C]
 ```
 
-clean/noisy 只通过逐 chunk 的时间条件区分：
+`clean_mask` 是区分 clean/noisy 的显式语义输入；时间值不再承担唯一的角色识别职责。当只传 transport 生成的 sample-level `time` 时，CI2V 的默认时间构造为：
 
 ```text
-frame_time = [0, t_video, t_video, t_video, t_video, t_video]
+time = [0, t_video, t_video, t_video, t_video, t_video]
 ```
 
-这是唯一新增的 clean/noisy 语义信号，不使用额外 role embedding。第 0 个 chunk 的 temporal position 为 0，target chunks 为 1～5，继续使用现有 3D RoPE。
+第 0 个 chunk 的 temporal position 为 0，target chunks 为 1～5，继续使用现有 3D RoPE。clean/noisy 的最终判断以 `clean_mask` 为准，即使未来 clean chunk 的时间值不是 0，也不会被误判为 noisy。
 
-当前 DiT 的 `time_embedder` 只接受 `[B]`，需要最小扩展为支持 `[B,6]`，并将每个 chunk 的时间 embedding 展开到对应的 view/spatial tokens。label embedding 继续广播到全部序列。
+### 时间条件适配
+
+统一的时间输入支持 scalar、`[B]` 和 `[B,T]`，并在进入 time embedder 前保持 batch/chunk 维度：
+
+```text
+time scalar       -> expand to [B]
+time [B]          -> broadcast to [B,T]
+time [B,T]        -> use directly
+```
+
+如果只提供 transport 的 `[B]` `time`，模型根据 `clean_mask` 构造逐 chunk 时间：clean 位置置为 0，其他位置使用 sample-level `time`。显式提供 `[B,T]` 的 `time` 时直接使用它，并校验其和序列 chunk 数一致。
+
+时间 embedding 直接支持 `[B]` 和 `[B,T]` 输入，分别返回 `[B,D]` 和 `[B,T,D]`，再展开到对应的 view/spatial tokens。
+
+### 类别条件适配
+
+类别标签也在统一的 `VRAEVideoDiT` 中做形状适配：
+
+```text
+labels [B]       -> embed once -> broadcast to all T chunks
+```
+
+默认 c2v 和 ci2v 都使用 `[B]` 的 sample-level class label，并广播到完整序列。`drop_mask` 同样只接受 `[B]`，在类别 embedding 生成后再扩展 chunk 维度。
 
 推荐模型边界：
 
 ```text
-transport input:  noisy_target [B,5,V,N,C]
-model condition:  image_clean [B,1,V,N,C]
-model internal:   concat -> [B,6,V,N,C]
-model output:     slice target chunks [B,5,V,N,C]
+caller input:     sequence [B,6,V,N,C]
+caller mask:      clean_mask [B,6]
+model input:      sequence + clean_mask
+model output:     [B,6,V,N,C] -> caller/engine slice target [B,5,V,N,C]
 ```
 
-DiT 的 sequence geometry 需要明确拆分：
+DiT 的 sequence geometry 根据输入模式动态确定：
 
 ```text
-condition_chunks = 1
-target_chunks = 5
-sequence_chunks = 6
+c2v:  condition_chunks = 0, target_chunks = 4, sequence_chunks = 4
+ci2v: condition_chunks = 1, target_chunks = 5, sequence_chunks = 6
 ```
 
-`full` 和 `base` 输出都只取后 5 个 target chunks，保持现有 flow transport 的输入输出 shape。
+`full` 和 `base` 输出都恢复为对应的完整序列。c2v 直接使用全部 4 个 chunks；ci2v 由训练/采样调用方切出后 5 个 target chunks，保持 flow matching 的输入输出 shape。
+
+构建器按任务选择模型：
+
+```text
+task=c2v  -> vrae_video_dit -> VRAEVideoDiT(sequence_chunks=4)
+task=ci2v -> vrae_video_dit -> VRAEVideoDiT(sequence_chunks=6)
+```
+
+两种任务共用 `dit.name: vrae_video_dit`，由调用方根据拼接后序列的长度和 `clean_mask` 选择 c2v/ci2v 几何。c2v 在未传 `clean_mask` 时默认所有 chunk 都是 noisy，保持旧调用路径和 checkpoint 兼容。
 
 ## 7. 时间条件、dropout 与 loss
 
-训练时 transport 只对 target latent 加噪：
+训练和采样都复用现有 transport。`training_losses` 接收完整的 clean sequence 和 `[B,T]` 的 `clean_mask`：mask 为 `True` 的 chunk 保持 clean，只有 `False` 的 target chunk 参与加噪和 loss。这样 CI2V 不需要额外的 `ConditionalModel`：
 
-```text
-t_video ~ configured time distribution
-x_target = (1 - t_video) * clean_target + t_video * noise
+```python
+def run_dit_forward(clean, labels, stream_ids, clean_mask):
+    losses = transport.training_losses(
+        model,
+        clean,
+        clean_mask=clean_mask,
+        model_kwargs={
+            "labels": labels,
+            "stream_ids": stream_ids,
+        },
+    )
+    return losses, losses["loss"]
 ```
 
-image condition：
+CI2V 在进入 `run_dit_forward` 前先拼接 `clean = torch.cat((image_clean, target_clean), dim=1)`；transport 内部只对 `clean_mask=False` 的 target chunks 生成 noisy state，因此送入 DiT 的 sequence 等价于 `torch.cat((image_clean, noisy_target), dim=1)`。
+
+clean image condition：
 
 ```text
 t_image = 0
@@ -234,17 +297,18 @@ noise_image = none
 image_condition remains clean
 ```
 
-CI2V 使用两个独立 mask：
+CI2V 不增加 image dropout，只保留已有的 class dropout 和一个序列语义 mask：
 
 ```text
-class_drop_mask [B]
-image_drop_mask [B]
-condition_mask   [B,6] = [1,0,0,0,0,0]
+class_drop_mask [B]   # 类别条件 dropout
+clean_mask      [B,6]  # [1,0,0,0,0,0]
 ```
 
-image dropout 时，将归一化后的 image slot 替换为全零 clean slot，保持序列长度不变；不新增 null image 参数。CFG 的 unconditional branch 同时移除类别和图像条件。
+image condition 始终以 clean latent 参与拼接，不置零、不采样 image dropout，也不新增 null image 参数。CFG 的 unconditional branch 只移除类别条件，仍保留 image condition；因此 CFG 主要提供 class guidance，而不是 image guidance。
 
-首版推荐 DiT 只返回 5 个 target chunks，因此 transport 不需要改成完整 6-chunk loss。若后续让 DiT 返回完整序列，再使用：
+训练时 c2v 和 ci2v 都调用同一个 `run_dit_forward(clean, labels, stream_ids, clean_mask)`。transport 只对 `clean_mask=False` 的 target 生成 noisy state，并用同一 mask 过滤 loss；DiT 始终接收完整 sequence 并返回完整输出，因此不需要额外的 `ConditionalModel`。
+
+统一的 `VRAEVideoDiT` 返回与输入 sequence 对齐的完整序列：c2v 返回 4 个 chunks，ci2v 返回 6 个 chunks。loss 直接由 transport 根据 `clean_mask` 过滤，首帧位置永远不参与 denoising loss：
 
 ```text
 loss_mask = [0,1,1,1,1,1]
@@ -259,10 +323,25 @@ loss_mask = [0,1,1,1,1,1]
 3. 对首帧 repeat 4 后编码、pool 和 normalize；
 4. 初始化 5 个 target latent chunks 的 noise；
 5. 每一步将 clean image latent 与当前 noisy target 沿时间维拼接；
-6. 使用 `frame_time=[0,t_video,...,t_video]` 调用 DiT；
+6. 调用方将二者拼接为 `sequence`，并使用 `clean_mask=[1,0,0,0,0,0]` 和 `time=[0,t_video,...,t_video]` 调用 DiT；
 7. 只更新后 5 个 target chunks；
 8. denormalize target latent，decoder 只解码 20 帧；
 9. 沿时间维把原始首帧拼到 decoder 输出前面。
+
+采样增强逻辑完全复用现有实现，不修改 `guidance.py` 和 `transport.py` 的 CFG/IG 算法：
+
+```text
+transport.euler_sample
+  -> guided_model_forward
+  -> conditional model call
+  -> unconditional model call（cfg_scale != 1 时）
+  -> internal guidance：full/base 先融合
+  -> CFG：unconditional + cfg_scale * (conditional - unconditional)
+  -> convert_model_prediction
+  -> Euler update target state
+```
+
+CI2V 只替换 conditional/unconditional model call 的输入准备：两个分支都使用同一个 clean image latent，分别把它和当前 target state 拼接后送入 DiT；两个分支只沿用现有 `class_drop_mask` 的差异。Euler state 始终是 `[B,5,V,N,C]`，不会把 clean image chunk 纳入更新。
 
 ```text
 decoder output: [B,20,V,3,H,W]
@@ -275,12 +354,12 @@ final output:   [B,21,V,3,H,W]
 
 | 文件/模块 | 修改内容 |
 |---|---|
-| `src/vrae/config.py` | task/trainer、帧数和 CI2V 配置校验 |
-| `src/vrae/data/lerobot.py` | 21 帧读取、首帧/目标拆分、indices |
+| `src/vrae/config.py` | task/trainer 和现有 `data.num_frames` 的 CI2V 兼容校验 |
+| `src/vrae/data/reconstruction.py` | 修改 `LiberoVideoDataset`；内部读取额外首帧，并在样本返回值增加首帧/目标字段和 indices |
 | `src/vrae/training/common/bounded_loader.py` | 搬运新 batch 字段 |
-| `src/vrae/training/common/engine.py` | 双路 stage1、shared statistics、CI2V sampling |
-| `src/vrae/models/dit/video_dit.py` | 6-chunk 拼接、逐 chunk time、target 输出切片 |
-| `src/vrae/models/dit/conditioning.py` | 独立 class/image dropout mask |
+| `src/vrae/training/common/engine.py` | 双路 stage1、shared statistics、CI2V 的输入拼接适配和首帧 prepend |
+| `src/vrae/models/dit/video_dit.py` | 扩展 `VRAEVideoDiT` 原生支持 c2v/ci2v，负责统一 sequence、`[B,T]` clean mask、逐 chunk time/label 适配和完整序列输出 |
+| `src/vrae/models/dit/conditioning.py` | 保持已有 class dropout，不增加 image dropout |
 | `configs/training/generation/` | 新增 CI2V 配置，保留 c2v 配置 |
 | `test/` | shape、mask、时间条件、解码长度和兼容性测试 |
 
@@ -290,9 +369,9 @@ final output:   [B,21,V,3,H,W]
 
 1. **配置与数据**：build-only 通过，固定输出 `21 -> 10 -> 5 -> 20`；验证多视角同步和 episode 边界。
 2. **Stage1 与 normalizer**：首帧和 target 都经过同一个 stage1/shared normalizer；验证 latent shape 和统计 metadata。
-3. **DiT 拼接**：验证输入 `[B,6,V,N,C]`、时间 `[0,t_video...]`、无 role embedding，输出 target `[B,5,V,N,C]`。
-4. **训练 loss**：验证首帧不加噪、不计 loss，target 正常 flow matching，CFG 同时移除 class/image 条件。
-5. **Sampling**：验证 decoder 只收到 5 个 latent chunks、输出 20 帧，最终拼接后为 `[B,21,V,3,H,W]`。
+3. **原生 VideoDiT**：验证同一个 `VRAEVideoDiT` 支持 c2v 和 ci2v；调用方传入已拼接的 sequence 与 `[B,T]` clean mask，CI2V 输入为 `[B,6,V,N,C]`、时间为 `[0,t_video,...]`，模型输出完整 `[B,6,V,N,C]`，再由 engine 切出 target `[B,5,V,N,C]`；c2v 回归不变。
+4. **训练 loss**：验证首帧不加噪、不计 loss，target 正常 flow matching；不产生 image dropout，CFG 只移除 class 条件并保留 image condition。
+5. **Sampling**：验证沿用现有 `euler_sample`、internal guidance 和 CFG；仅在每次送入 DiT 前拼接 clean image，decoder 只收到 5 个 latent chunks、输出 20 帧，最后 prepend 原始首帧得到 `[B,21,V,3,H,W]`。
 6. **兼容性**：旧 c2v 配置和 checkpoint 不回归；CI2V checkpoint 的 resume 必须匹配 task、geometry、normalizer 和 view 数。
 7. **效果 smoke test**：固定类别和首帧做小规模 overfit，替换首帧后生成结果应发生可观测变化。
 

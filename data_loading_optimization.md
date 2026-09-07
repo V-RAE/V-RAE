@@ -6,7 +6,7 @@ Workload: 20 frames, interval 3, two 256x256 camera views, batch size 24
 
 ## Baseline: inherited LeRobot reader
 
-The original `ReconstructionDataset` inherited `LeRobotDataset`, whose HF
+The original `LiberoVideoDataset` inherited `LeRobotDataset`, whose HF
 dataset installed `hf_transform_to_torch`. A selected column therefore entered
 the transform path and decoded image columns through PIL. On the current
 machine, direct single-sample measurements were 5.09–12.33 s. A 24-sample
@@ -48,7 +48,7 @@ well below the inherited PIL path.
 
 ## Iteration 2: remove the LeRobotDataset inheritance
 
-`ReconstructionDataset` now loads metadata directly, creates a raw Arrow
+`LiberoVideoDataset` now loads metadata directly, creates a raw Arrow
 dataset without installing the HF transform, and retains only camera columns
 plus `timestamp`. The full Parquet column list is used for cache reuse, then
 `select_columns` avoids rebuilding a second large Arrow cache. Video-backed

@@ -1,0 +1,47 @@
+include:
+  - libero_videodit.yaml
+
+task: ci2v
+trainer: libero_videogen
+run_name: vjepa2_1_libero_ci2v
+task_config:
+  c2v: {status: active, condition: [class]}
+  ci2v:
+    status: active
+    condition: [class, image]
+    image_condition:
+      source: first_frame
+      multiview: true
+      pooling: same_as_target
+      temporal_lift: repeat_to_four_frames
+    video_target:
+      frames: 20
+      frame_interval: 1
+    sampling:
+      decode_frames: 20
+      prepend_condition_frame: true
+  ti2v: {status: reserved, condition: [text, image]}
+  t2v: {status: reserved, condition: [text]}
+data:
+  dataset: reconstruction
+  manifest: data/metadata/libero_reconstruction.csv
+  camera_keys:
+    - {key: observation.images.image, name: head, stream_id: 0}
+    - {key: observation.images.image2, name: wrist, stream_id: 1}
+  num_frames: 21
+  frame_interval: 1
+  random_frame_interval: false
+model:
+  multiview:
+    enabled: true
+    num_views: 2
+dit:
+  image_condition: true
+  image_condition_injection: temporal_concat
+  class_dropout: 0.10
+latent_normalizer:
+  path: ckpts/libero_videogen/latent_stats/ci2v_shared_20f_multiview.pt
+transport:
+  time_dist_shift: 25.298221281347036
+sampling:
+  decode_frames: 20

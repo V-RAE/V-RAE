@@ -125,15 +125,18 @@ class GaussianFourierTimeEmbedding(nn.Module):
         )
 
     def forward(self, time: torch.Tensor) -> torch.Tensor:
+        """Embed sample times, preserving ``[B]`` or ``[B,T]`` leading dims."""
         if time.ndim == 0:
             time = time[None]
-        if time.ndim != 1:
-            raise ValueError(f"time must be scalar or [B], got {tuple(time.shape)}")
-        angles = time.float()[:, None] * self.frequencies.float()[None, :] * (2 * torch.pi)
+        if time.ndim not in (1, 2):
+            raise ValueError(f"time must have shape [B] or [B,T], got {tuple(time.shape)}")
+        input_shape = time.shape
+        flat_time = time.reshape(-1)
+        angles = flat_time.float()[:, None] * self.frequencies.float()[None, :] * (2 * torch.pi)
         features = torch.cat((angles.sin(), angles.cos()), dim=-1)
         parameter = self.mlp[0].weight
         features = features.to(device=parameter.device, dtype=parameter.dtype)
-        return self.mlp(features).unsqueeze(1)
+        return self.mlp(features).reshape(*input_shape, -1)
 
 
 class QKNormAttention(nn.Module):

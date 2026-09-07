@@ -21,13 +21,15 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
     from vrae.training.common.wandb import validate_wandb_config
 
     validate_wandb_config(config["wandb"])
-    if config.get("task") != "libero_videogen":
-        raise ValueError("LIBERO generation requires task=libero_videogen")
+    if config.get("task") not in {"libero_videogen", "c2v", "ci2v"}:
+        raise ValueError("LIBERO generation requires task=libero_videogen, c2v, or ci2v")
     dataset_name = str(config["data"].get("dataset", "lerobot"))
     if dataset_name not in {"lerobot", "reconstruction"}:
         raise ValueError(
             "LIBERO generation requires data.dataset=lerobot or reconstruction"
         )
+    if config.get("task") == "ci2v" and dataset_name != "reconstruction":
+        raise ValueError("CI2V requires data.dataset=reconstruction")
 
     num_classes = int(config["dit"]["num_classes"])
     if num_classes <= 0:
@@ -37,7 +39,10 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("sampling.class_ids must reference valid LIBERO classes")
 
     num_frames = int(config["data"]["num_frames"])
-    if num_frames <= 0 or num_frames % 4:
+    if config.get("task") == "ci2v":
+        if num_frames != 21:
+            raise ValueError("CI2V requires data.num_frames=21")
+    elif num_frames <= 0 or num_frames % 4:
         raise ValueError("data.num_frames must be a positive multiple of four")
     cameras = config["data"]["camera_keys"]
     multiview = config["model"].get("multiview", {})
@@ -47,12 +52,15 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
 
     transport = flow_transport_metadata(config)
     num_chunks = num_frames // 4
+    if config.get("task") == "ci2v":
+        num_chunks = (num_frames - 1) // 4 + 1
     image_size = int(config["data"]["image_size"])
     patch_size = int(config["model"]["encoder"]["patch_size"])
     hidden_size = int(config["model"]["encoder"]["hidden_size"])
     spatial_tokens = (image_size // patch_size) ** 2
+    transport_chunks = num_chunks - 1 if config.get("task") == "ci2v" else num_chunks
     expected_shift = math.sqrt(
-        num_chunks * num_views * spatial_tokens * hidden_size / 4096
+        transport_chunks * num_views * spatial_tokens * hidden_size / 4096
     )
     if transport["prediction"] != "x":
         raise ValueError("LIBERO VideoDiT uses x-prediction")

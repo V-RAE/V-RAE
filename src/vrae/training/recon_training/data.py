@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from vrae.training.common.contracts import resolve_batch_contract
 from vrae.training.common.sampler import StatefulDistributedBatchSampler
 from vrae.paths import ProjectPaths
-from vrae.data.reconstruction import ReconstructionDataset
+from vrae.data.reconstruction import LiberoVideoDataset
 
 
 def flatten_multiview_video(video: torch.Tensor) -> torch.Tensor:
@@ -66,7 +66,7 @@ class CudaVideoPrefetchIterator:
 
 def build_reconstruction_dataset(
     config: Mapping[str, Any], paths: ProjectPaths
-) -> ReconstructionDataset:
+) -> LiberoVideoDataset:
     data = config["data"]
     root_value = data.get("root")
     root = paths.dataset("lerobot") if not root_value else str(root_value)
@@ -76,7 +76,7 @@ def build_reconstruction_dataset(
     manifest_path = Path(str(manifest))
     if not manifest_path.is_absolute():
         manifest_path = paths.project_root / manifest_path
-    return ReconstructionDataset(
+    return LiberoVideoDataset(
         root,
         manifest_path,
         repo_id=str(data.get("repo_id", "libero")),
@@ -88,6 +88,7 @@ def build_reconstruction_dataset(
         image_size=int(data.get("image_size", 256)),
         random_flip=bool(data.get("random_flip", True)),
         seed=int(data.get("seed", 3407)),
+        task=str(config.get("task", "reconstruction")),
     )
 
 
@@ -105,6 +106,11 @@ def collate_reconstruction(items: list[dict[str, Any]]) -> dict[str, Any]:
             [int(item["frame_interval"]) for item in items], dtype=torch.long
         ),
     }
+    for key in ("condition_frame_indices", "target_frame_indices"):
+        if key in items[0]:
+            batch[key] = torch.stack([item[key] for item in items])
+    if "clean_mask" in items[0]:
+        batch["clean_mask"] = torch.stack([item["clean_mask"] for item in items])
     for key in ("state", "action"):
         if key in items[0]:
             batch[key] = torch.stack([item[key] for item in items])

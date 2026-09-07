@@ -177,7 +177,9 @@ def prepare_run(
         override=paths_path,
         project_root=find_project_root(config_path),
     )
-    run = paths.training_run(str(config["task"]), str(config["run_name"]), create=False)
+    task = str(config["task"])
+    run_task = "libero_videogen" if task in {"c2v", "ci2v"} else task
+    run = paths.training_run(run_task, str(config["run_name"]), create=False)
     root_error: Exception | None = None
     failure: dict[str, str] | None = None
     if distributed.is_main:
@@ -255,7 +257,7 @@ class ClassConditionalVideoDataset:
         root_value = data.get("root")
         root = Path(str(root_value)).expanduser() if root_value else paths.dataset("lerobot")
         if dataset_name == "reconstruction":
-            from vrae.data.reconstruction import ReconstructionDataset
+            from vrae.data.reconstruction import LiberoVideoDataset
 
             manifest = data.get("manifest")
             if not manifest:
@@ -263,7 +265,7 @@ class ClassConditionalVideoDataset:
             manifest_path = Path(str(manifest))
             if not manifest_path.is_absolute():
                 manifest_path = paths.project_root / manifest_path
-            return ReconstructionDataset(
+            return LiberoVideoDataset(
                 root,
                 manifest_path,
                 repo_id=str(data.get("repo_id", "libero")),
@@ -277,6 +279,7 @@ class ClassConditionalVideoDataset:
                 image_size=int(data.get("image_size", 256)),
                 random_flip=bool(data.get("random_flip", True)),
                 seed=int(data.get("seed", 3407)),
+                task=str(config.get("task", "reconstruction")),
             )
         if dataset_name != "lerobot":
             raise ValueError(
@@ -371,6 +374,15 @@ def build_class_conditional_loader(
     return loader, sampler
 
 
+def _generation_num_chunks(config: Mapping[str, Any]) -> int:
+    num_frames = int(config["data"]["num_frames"])
+    if config.get("task") == "ci2v":
+        if num_frames != 21:
+            raise ValueError("CI2V requires data.num_frames=21")
+        return 1 + (num_frames - 1) // 4
+    return num_frames // 4
+
+
 def load_frozen_stage1(config: Mapping[str, Any], paths: ProjectPaths, device: torch.device):
     from vrae.training.common.contracts import STAGE1_WEIGHT_COMPATIBILITY_FIELDS
     from vrae.training.common.ema import ExponentialMovingAverage
@@ -427,7 +439,7 @@ def compute_class_conditional_latent_stats(
     del stage1_checkpoint_payload
     dataset = ClassConditionalVideoDataset.build(config, paths, dataset_name)
     if dataset_name == "reconstruction":
-        # ReconstructionDataset indexes one sampled clip per valid episode.
+        # LiberoVideoDataset indexes one sampled clip per valid episode.
         clip_indices = list(range(len(dataset)))
     else:
         clip_indices = episode_start_indices(dataset)
@@ -470,8 +482,19 @@ def compute_class_conditional_latent_stats(
                 video = batch["video"].to(context.device, non_blocking=True)
                 if video.dtype == torch.uint8:
                     video = video.float().div_(255.0)
-                video = flatten_multiview_video(video)
-                stats.update(stage1.encode_grid(video))
+                if config.get("task") == "ci2v":
+                    image = video[:, :1]
+                    target = video[:, 1:]
+                    if image.dtype == torch.uint8:
+                        image = image.float().div_(255.0)
+                    if target.dtype == torch.uint8:
+                        target = target.float().div_(255.0)
+                    image = flatten_multiview_video(image).repeat_interleave(4, dim=1)
+                    target = flatten_multiview_video(target)
+                    stats.update(stage1.encode_grid(image))
+                    stats.update(stage1.encode_grid(target))
+                else:
+                    stats.update(stage1.encode_grid(flatten_multiview_video(video)))
                 progress.update(1)
     finally:
         progress.close()
@@ -483,10 +506,23 @@ def compute_class_conditional_latent_stats(
         "stage1_checkpoint": str(config["stage1"]["checkpoint"]),
         "dataset": dataset_name,
         "split": str(config["data"].get("split", "train")),
-        "scope": "one_clip_per_episode",
+        "scope": (
+            "target_and_repeated_first_frame"
+            if config.get("task") == "ci2v"
+            else "one_clip_per_episode"
+        ),
         "clean_latent": True,
         "normalized": False,
         "clean_latents": True,
+        **(
+            {
+                "condition_temporal_lift": "repeat_4",
+                "target_frames": 20,
+                "latent_frames": 5,
+            }
+            if config.get("task") == "ci2v"
+            else {}
+        ),
     }
     normalizer = stats.finalize(metadata=metadata)
     if context.is_main:
@@ -516,7 +552,7 @@ def load_class_conditional_sampling_stack(
     if stage1_checkpoint_override is not None:
         stage1_config["stage1"]["checkpoint"] = str(stage1_checkpoint_override)
     stage1, _ = load_frozen_stage1(stage1_config, paths, device)
-    chunks = int(config["data"]["num_frames"]) // 4
+    chunks = _generation_num_chunks(config)
     dit = build_class_conditional_dit(config, stage1.metadata(), num_chunks=chunks).to(device)
     normalizer_path = paths.checkpoint(
         latent_normalizer_override
@@ -530,7 +566,11 @@ def load_class_conditional_sampling_stack(
         stage1_checkpoint=str(config["stage1"]["checkpoint"]),
         dataset=str(config["data"]["dataset"]),
         split=str(config["data"].get("split", "train")),
-        scope="one_clip_per_episode",
+        scope=(
+            "target_and_repeated_first_frame"
+            if config.get("task") == "ci2v"
+            else "one_clip_per_episode"
+        ),
     )
     payload = load_checkpoint(paths.checkpoint(checkpoint))
     expected_metadata = class_conditional_metadata(config, stage1.metadata(), dit, normalizer)
@@ -559,6 +599,10 @@ def build_class_conditional_dit(
     patch = int(stage1_metadata["patch_size"])
     grid = (int(image_size[0]) // patch, int(image_size[1]) // patch)
     dit_config = dict(config["dit"])
+    # CI2V uses clean-mask conditioning; these descriptive config fields are
+    # not constructor arguments of the current VideoDiT implementation.
+    dit_config.pop("image_condition", None)
+    dit_config.pop("image_condition_injection", None)
     multiview = config.get("model", {}).get("multiview", {})
     if isinstance(multiview, Mapping):
         dit_config.setdefault("multiview_enabled", bool(multiview.get("enabled", False)))
@@ -666,7 +710,7 @@ def train_class_conditional(
         raise ValueError("class_map.json does not match the dataset metadata")
     if map_num_classes != int(config["dit"]["num_classes"]):
         raise ValueError("dit.num_classes must match the dataset class map")
-    num_chunks = int(config["data"]["num_frames"]) // 4
+    num_chunks = _generation_num_chunks(config)
     dit = build_class_conditional_dit(config, stage1.metadata(), num_chunks=num_chunks).to(
         context.device
     )
@@ -696,7 +740,11 @@ def train_class_conditional(
         stage1_checkpoint=str(config["stage1"]["checkpoint"]),
         dataset=dataset_name,
         split=str(config["data"].get("split", "train")),
-        scope="one_clip_per_episode",
+        scope=(
+            "target_and_repeated_first_frame"
+            if config.get("task") == "ci2v"
+            else "one_clip_per_episode"
+        ),
     )
     metadata = class_conditional_metadata(config, stage1.metadata(), dit, normalizer)
     optimizer = build_optimizer(dit.parameters(), config["training"]["optimizer"])
@@ -764,11 +812,23 @@ def train_class_conditional(
     resume_path = config["training"].get("resume")
     metadata_fields = tuple(metadata)
     if init_path:
+        init_metadata_fields = metadata_fields
+        if config.get("task") == "ci2v":
+            init_metadata_fields = tuple(
+                field
+                for field in metadata_fields
+                if field
+                not in {
+                    "dit_num_chunks",
+                    "latent_normalizer_source",
+                    "latent_normalizer_identity",
+                }
+            )
         load_model_init(
             paths.checkpoint(init_path),
             dit,
             expected_metadata=metadata,
-            metadata_fields=metadata_fields,
+            metadata_fields=init_metadata_fields,
         )
     if resume_path:
         resume_checkpoint = paths.checkpoint(resume_path)
@@ -881,16 +941,32 @@ def train_class_conditional(
                 clean = flat_tokens
             return normalizer.normalize(clean)
 
+    def run_ci2v_stage1(
+        image_condition: torch.Tensor,
+        video_target: torch.Tensor,
+        *,
+        multiview: bool,
+        views: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        image = flatten_multiview_video(image_condition)
+        image = image.repeat_interleave(4, dim=1)
+        target = flatten_multiview_video(video_target)
+        image_clean = run_stage1(image, multiview=multiview, views=views)
+        target_clean = run_stage1(target, multiview=multiview, views=views)
+        return image_clean, target_clean
+
     @profiler("dit.forward", gpu_util=True)
     def run_dit_forward(
         clean: torch.Tensor,
         labels: torch.Tensor,
         stream_ids: torch.Tensor | None,
+        clean_mask: torch.Tensor,
     ):
         with precision.autocast():
             losses = transport.training_losses(
                 model,
                 clean,
+                clean_mask=clean_mask,
                 model_kwargs={
                     "labels": labels,
                     **(
@@ -1002,7 +1078,6 @@ def train_class_conditional(
             input_has_views = video.ndim == 6
             multiview = input_has_views and bool(getattr(dit, "multiview_enabled", False))
             views = int(video.shape[2]) if input_has_views else 1
-            flat_video = flatten_multiview_video(video)
             labels = batch["label"].to(context.device, non_blocking=True)
             if not multiview and views > 1:
                 labels = labels.repeat_interleave(views)
@@ -1011,11 +1086,44 @@ def train_class_conditional(
                 stream_ids = stream_ids.to(context.device, non_blocking=True)
             else:
                 stream_ids = None
+            clean_mask = batch.get("clean_mask")
+            if clean_mask is None:
+                clean_mask = torch.zeros(
+                    video.shape[0],
+                    _generation_num_chunks(config),
+                    dtype=torch.bool,
+                    device=context.device,
+                )
+            else:
+                clean_mask = clean_mask.to(context.device, non_blocking=True)
+            if not multiview and views > 1:
+                clean_mask = clean_mask.repeat_interleave(views, dim=0)
             profiler.finish_h2d()
-            clean = run_stage1(flat_video, multiview=multiview, views=views)
+            if config.get("task") == "ci2v":
+                image_condition = video[:, :1]
+                video_target = video[:, 1:]
+                if image_condition.dtype == torch.uint8:
+                    image_condition = image_condition.float().div_(255.0)
+                if video_target.dtype == torch.uint8:
+                    video_target = video_target.float().div_(255.0)
+                image_clean, target_clean = run_ci2v_stage1(
+                    image_condition,
+                    video_target,
+                    multiview=multiview,
+                    views=views,
+                )
+                clean = torch.cat((image_clean, target_clean), dim=1)
+            else:
+                flat_video = flatten_multiview_video(video)
+                clean = run_stage1(flat_video, multiview=multiview, views=views)
             profiler.finish_stage1()
             with accumulation.sync_context(model):
-                losses, loss = run_dit_forward(clean, labels, stream_ids)
+                losses, loss = run_dit_forward(
+                    clean,
+                    labels,
+                    stream_ids,
+                    clean_mask,
+                )
                 run_dit_backward(loss)
             profiler.finish_backward()
             sampler.commit_batch()
@@ -1198,6 +1306,25 @@ def train_class_conditional(
                         sample_labels = torch.arange(sample_count) % int(dit.num_classes)
                     was_training = dit.training
                     dit.eval()
+                    sample_image_condition = None
+                    sample_raw_condition = None
+                    if config.get("task") == "ci2v":
+                        raw_batch = video[:, :1]
+                        raw_indices = torch.arange(sample_count) % raw_batch.shape[0]
+                        sample_raw_condition = raw_batch[raw_indices]
+                        sample_image = sample_raw_condition.to(
+                            context.device, non_blocking=True
+                        )
+                        if sample_image.dtype == torch.uint8:
+                            sample_image = sample_image.float().div_(255.0)
+                        sample_image = flatten_multiview_video(sample_image)
+                        sample_image = sample_image.repeat_interleave(4, dim=1)
+                        sample_image = run_stage1(
+                            sample_image,
+                            multiview=multiview,
+                            views=views,
+                        )
+                        sample_image_condition = sample_image
                     with ema.average_parameters(dit), precision.autocast():
                         sampled_video = generate_class_conditional(
                             dit,
@@ -1207,7 +1334,7 @@ def train_class_conditional(
                             sample_ids=sample_ids,
                             labels=sample_labels,
                             base_seed=int(config["sampling"]["base_seed"]),
-                            num_chunks=dit.num_chunks,
+                            num_chunks=(dit.num_chunks - 1 if config.get("task") == "ci2v" else dit.num_chunks),
                             grid_size=tuple(dit.grid_size),
                             channels=dit.in_channels,
                             steps=int(config["sampling"]["steps"]),
@@ -1222,6 +1349,8 @@ def train_class_conditional(
                                 config["sampling"].get("internal_guidance_t_max", 1.0)
                             ),
                             device=context.device,
+                            image_condition=sample_image_condition,
+                            raw_condition_frame=sample_raw_condition,
                         )
                     dit.train(was_training)
                     save_sample_tensors(
@@ -1375,6 +1504,8 @@ def generate_class_conditional(
     device: torch.device,
     internal_guidance_t_min: float = 0.0,
     internal_guidance_t_max: float = 1.0,
+    image_condition: torch.Tensor | None = None,
+    raw_condition_frame: torch.Tensor | None = None,
 ) -> torch.Tensor:
     def sample_seed(sample_id: int) -> int:
         value = ((int(base_seed) << 32) ^ int(sample_id)) & 0xFFFFFFFFFFFFFFFF
@@ -1410,23 +1541,28 @@ def generate_class_conditional(
     conditional_mask = torch.zeros(labels.shape[0], dtype=torch.bool, device=device)
     unconditional_mask = torch.ones_like(conditional_mask)
     stream_kwargs = {"stream_ids": stream_ids} if stream_ids is not None else {}
+    model_kwargs = {
+        "labels": labels,
+        "condition_drop_mask": conditional_mask,
+        **stream_kwargs,
+    }
+    unconditional_kwargs = {
+        "labels": labels,
+        "condition_drop_mask": unconditional_mask,
+        **stream_kwargs,
+    }
     normalized = transport.euler_sample(
         dit,
         noise,
-        model_kwargs={
-            "labels": labels,
-            "condition_drop_mask": conditional_mask,
-            **stream_kwargs,
-        },
-        unconditional_kwargs={
-            "labels": labels,
-            "condition_drop_mask": unconditional_mask,
-            **stream_kwargs,
-        },
+        model_kwargs=model_kwargs,
+        unconditional_kwargs=unconditional_kwargs,
         num_steps=steps,
         cfg_scale=cfg_scale,
         ig_scale=internal_guidance_scale,
         ig_intervals=((internal_guidance_t_min, internal_guidance_t_max),),
+        clean_condition=(
+            image_condition.to(device=device) if image_condition is not None else None
+        ),
     )
     if multiview:
         # DiT keeps views explicit: [B,T,V,N,C]. The single-view V-RAE
@@ -1444,7 +1580,7 @@ def generate_class_conditional(
             width=grid_size[1],
         )
         decoded = stage1.decode_grid(flat_grid)
-        return decoded.reshape(
+        decoded = decoded.reshape(
             batch,
             views,
             decoded.shape[1],
@@ -1452,10 +1588,16 @@ def generate_class_conditional(
             decoded.shape[3],
             decoded.shape[4],
         ).permute(0, 2, 1, 3, 4, 5).contiguous()
+        if raw_condition_frame is not None:
+            decoded = torch.cat((raw_condition_frame.to(decoded), decoded), dim=1)
+        return decoded
     clean_tokens = normalizer.denormalize(normalized)
     clean_grid = stage1.tokens_to_grid(
         clean_tokens,
         height=grid_size[0],
         width=grid_size[1],
     )
-    return stage1.decode_grid(clean_grid)
+    decoded = stage1.decode_grid(clean_grid)
+    if raw_condition_frame is not None:
+        decoded = torch.cat((raw_condition_frame.to(decoded), decoded), dim=1)
+    return decoded

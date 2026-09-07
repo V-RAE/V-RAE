@@ -324,6 +324,11 @@ class BoundedThreadBatchLoader:
             "_video_normalized": torch.is_floating_point(video),
             "_video_pinned": bool(video.is_pinned()),
         }
+        for key in ("condition_frame_indices", "target_frame_indices"):
+            if key in items[0]:
+                batch[key] = torch.stack([item[key] for item in items])
+        if "clean_mask" in items[0]:
+            batch["clean_mask"] = torch.stack([item["clean_mask"] for item in items])
         if "stream_ids" in items[0]:
             batch["stream_ids"] = torch.stack([item["stream_ids"] for item in items])
         for key in ("state", "action"):

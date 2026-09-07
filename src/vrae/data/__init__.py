@@ -1,6 +1,6 @@
 """Self-contained LeRobot v3 data loading for V-RAE training."""
 
 from .lerobot import LeRobotVideoDataset
-from .reconstruction import ReconstructionDataset
+from .reconstruction import LiberoVideoDataset, ReconstructionDataset
 
-__all__ = ["LeRobotVideoDataset", "ReconstructionDataset"]
+__all__ = ["LeRobotVideoDataset", "LiberoVideoDataset", "ReconstructionDataset"]

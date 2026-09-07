@@ -90,7 +90,7 @@ def _random_crop(video: torch.Tensor, image_size: int, generator: torch.Generato
     return video[:, :, top : top + image_size, left : left + image_size]
 
 
-class ReconstructionDataset(torch.utils.data.Dataset):
+class LiberoVideoDataset(torch.utils.data.Dataset):
     """Sample strict, random, single-view clips from a LeRobot manifest.
 
     This reader loads only the metadata and raw columns needed for temporal
@@ -113,9 +113,16 @@ class ReconstructionDataset(torch.utils.data.Dataset):
         image_size: int = 256,
         random_flip: bool = True,
         seed: int = 3407,
+        task: str = "reconstruction",
     ) -> None:
-        if num_frames <= 0 or num_frames % 4:
-            raise ValueError("num_frames must be a positive multiple of four")
+        self.task = str(task)
+        self.is_ci2v = self.task == "ci2v"
+        if num_frames <= 0 or (
+            (self.is_ci2v and (num_frames - 1) % 4)
+            or (not self.is_ci2v and num_frames % 4)
+        ):
+            expected = "num_frames - 1" if self.is_ci2v else "num_frames"
+            raise ValueError(f"{expected} must be a positive multiple of four")
         if frame_interval <= 0:
             raise ValueError("frame_interval must be positive")
         if frame_interval_min <= 0 or frame_interval_max < frame_interval_min:
@@ -191,6 +198,14 @@ class ReconstructionDataset(torch.utils.data.Dataset):
             episode_id: nested_id for nested_id, episode_id in enumerate(self.episodes)
         }
         self.reconstruction_num_frames = int(num_frames)
+        self.num_chunks = (
+            1 + (self.reconstruction_num_frames - 1) // 4
+            if self.is_ci2v
+            else self.reconstruction_num_frames // 4
+        )
+        self.clean_mask = torch.zeros(self.num_chunks, dtype=torch.bool)
+        if self.is_ci2v:
+            self.clean_mask[0] = True
         self.frame_interval = int(frame_interval)
         self.random_frame_interval = bool(random_frame_interval)
         self.frame_interval_min = int(frame_interval_min)
@@ -448,8 +463,16 @@ class ReconstructionDataset(torch.utils.data.Dataset):
             "episode_index": episode,
             "view": view.view_key,
             "frame_interval": interval,
+            "clean_mask": self.clean_mask.clone(),
             **({"stream_ids": torch.tensor([camera["stream_id"] for camera in self.camera_keys], dtype=torch.long)} if self.camera_keys else {}),
         }
+        if self.is_ci2v:
+            result.update(
+                {
+                    "condition_frame_indices": global_indices[0:1].contiguous(),
+                    "target_frame_indices": global_indices[1:].contiguous(),
+                }
+            )
         with self._profile_lock:
             self._profile_sample_count += 1
             self._profile_totals["sample.total"] += time.perf_counter() - sample_started_at
@@ -474,4 +497,12 @@ class ReconstructionDataset(torch.utils.data.Dataset):
             raise ValueError(f"Unknown task_index {task_index} for episode {episode}") from error
 
 
-__all__ = ["LiberoManifestView", "ReconstructionDataset", "load_libero_manifest"]
+# Backward-compatible name for existing reconstruction training entry points.
+ReconstructionDataset = LiberoVideoDataset
+
+__all__ = [
+    "LiberoManifestView",
+    "LiberoVideoDataset",
+    "ReconstructionDataset",
+    "load_libero_manifest",
+]

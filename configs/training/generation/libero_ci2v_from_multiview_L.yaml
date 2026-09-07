@@ -1,0 +1,26 @@
+include:
+  - libero_ci2v.yaml
+
+run_name: vjepa2_1_libero_ci2v_from_multiview_l_gc
+dit:
+  hidden_size: [1536, 2048]
+  depth: [28, 2]
+  encoder_depth: 8
+  num_heads: [24, 16]
+  gradient_checkpointing: true
+training:
+  init_from: null
+  resume: null
+  global_batch_size: 16
+  gradient_accumulation_steps: 4
+runtime:
+  profile:
+    gpu_util: true
+    gpu_util_interval_seconds: 0.02
+    synchronize_phases: false
+    warmup_steps: 20
+    interval_steps: 100
+    output_file: profile.json
+wandb:
+  group: libero_videogen_ci2v
+  tags: [libero, ci2v, multiview, vjepa2_1, dit_l, init_multiview_l]
