@@ -1,7 +1,0 @@
-include: config.yaml
-
-run:
-  name: ucf101-tfvd-eupe-dt3
-
-checkpoints:
-  stage1: ckpts/vrae/vrae_eupe.pt

@@ -41,13 +41,19 @@ class VRAELatentAdapter(nn.Module):
         return self
 
     @torch.no_grad()
-    def encode_grid(self, video: torch.Tensor) -> torch.Tensor:
+    def encode_grid(
+        self,
+        video: torch.Tensor,
+    ) -> torch.Tensor:
         with self._autocast(video):
             latents = self._autoencoder.encode(video)
         return latents.float()
 
     @torch.no_grad()
-    def decode_grid(self, latents: torch.Tensor) -> torch.Tensor:
+    def decode_grid(
+        self,
+        latents: torch.Tensor,
+    ) -> torch.Tensor:
         with self._autocast(latents):
             video = self._autoencoder.decode(latents)
         return video.float()
@@ -66,9 +72,9 @@ class VRAELatentAdapter(nn.Module):
         if tokens.ndim != 4 or tokens.shape[2] != height * width:
             raise ValueError(f"Expected [B,T,{height * width},C], got {tuple(tokens.shape)}")
         batch, time, _, channels = tokens.shape
-        return (
-            tokens.reshape(batch, time, height, width, channels).permute(0, 1, 4, 2, 3).contiguous()
-        )
+        return tokens.reshape(batch, time, height, width, channels).permute(
+            0, 1, 4, 2, 3
+        ).contiguous()
 
     def metadata(self) -> dict[str, Any]:
         return dict(self._metadata)

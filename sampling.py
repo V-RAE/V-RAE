@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""Reconstruct the three sample videos with a released V-RAE checkpoint."""
+"""Sample a trained class-conditional VideoDiT checkpoint.
+
+Typical usage after training finishes::
+
+    python sampling.py
+
+Use ``--config`` when the checkpoint was trained with another configuration.
+"""
 
 from __future__ import annotations
 
 import argparse
-import copy
-import gc
-import os
+import json
 import sys
-from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
-from torch import nn
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -22,260 +25,263 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-SAMPLES = tuple(PROJECT_ROOT / "assets" / f"sample{index}.mp4" for index in range(1, 4))
-VARIANTS = {
-    "dino": ("dinov3", PROJECT_ROOT / "ckpts/vrae/vrae_dinov3.pt"),
-    "siglip": ("siglip2", PROJECT_ROOT / "ckpts/vrae/vrae_siglip2.pt"),
-    "vjepa": ("vjepa2_1", PROJECT_ROOT / "ckpts/vrae/vrae_vjepa2.1.pt"),
-    "eupe": ("eupe", PROJECT_ROOT / "ckpts/vrae/vrae_eupe.pt"),
-}
+DEFAULT_CONFIG = PROJECT_ROOT / "configs/training/generation/vjepa2_1_libero_videodit_high_util_fixed.yaml"
 
-SUPPORTED_NUM_FRAMES = (16, 20)
-IMAGE_SIZE = (256, 256)
-HEADER_HEIGHT = 40
-HEADER_FONT_SIZE = 20
-LABELS = ("Original Video", "Reconstructed Video")
+
+def parse_labels(
+    value: str | None,
+    *,
+    num_samples: int,
+    num_classes: int,
+    default_labels: list[int] | None = None,
+) -> list[int]:
+    if value is None or not value.strip():
+        labels = default_labels or list(range(num_classes))
+        return [labels[index % len(labels)] for index in range(num_samples)]
+    labels = [int(item.strip()) for item in value.split(",") if item.strip()]
+    if not labels:
+        raise ValueError("--labels must contain at least one integer")
+    if any(label < 0 or label >= num_classes for label in labels):
+        raise ValueError(f"--labels must be in [0, {num_classes})")
+    return [labels[index % len(labels)] for index in range(num_samples)]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Reconstruct assets/sample1.mp4 through sample3.mp4 on cuda:0."
+        description="Sample generated videos from a trained VideoDiT checkpoint."
     )
     parser.add_argument(
-        "variant",
-        choices=tuple(VARIANTS),
-        help="V-RAE checkpoint to use",
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        help=f"training config (default: {DEFAULT_CONFIG.relative_to(PROJECT_ROOT)})",
     )
     parser.add_argument(
-        "--num-frames",
-        type=int,
-        choices=SUPPORTED_NUM_FRAMES,
+        "--checkpoint",
+        type=Path,
         default=None,
+        help="checkpoint path; defaults to the config run's checkpoints/latest.pt",
     )
+    parser.add_argument(
+        "--paths",
+        type=Path,
+        default=None,
+        help="optional project path mapping, matching the training entry point",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="output directory; defaults to the checkpoint run's samples directory",
+    )
+    parser.add_argument("--num-samples", type=int, default=4)
+    parser.add_argument(
+        "--labels",
+        default=None,
+        help="comma-separated class ids, repeated cyclically to num-samples",
+    )
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument("--cfg-scale", type=float, default=None)
+    parser.add_argument("--internal-guidance-scale", type=float, default=None)
+    parser.add_argument("--device", default="cuda", help="torch device (default: cuda)")
     return parser.parse_args()
 
 
-def as_mapping(value: object, name: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{name} must be a mapping")
-    return value
+def resolve_path(path: Path, *, root: Path) -> Path:
+    return path if path.is_absolute() else root / path
 
 
-def prepare_model_config(
-    raw_config: Mapping[str, Any],
-    expected_encoder: str,
-) -> dict[str, Any]:
-    config = copy.deepcopy(dict(raw_config))
-    has_model_section = "model" in config
-    model_config = dict(
-        as_mapping(config["model"] if has_model_section else config, "model config")
+def resolve_checkpoint(
+    checkpoint: Path | None,
+    *,
+    config: dict[str, Any],
+    paths: Any,
+) -> Path:
+    if checkpoint is not None:
+        return paths.checkpoint(checkpoint)
+    run = paths.training_run(str(config["task"]), str(config["run_name"]), create=False)
+    return run / "checkpoints" / "latest.pt"
+
+
+def save_outputs(
+    sampled_video: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    output_dir: Path,
+    fps: int,
+    checkpoint: Path,
+    config_path: Path,
+) -> None:
+    from vrae.training.common.visualization import save_sample_tensors, save_video_mp4
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tensor_path = output_dir / "samples.pt"
+    save_sample_tensors(
+        {
+            "video": sampled_video,
+            "labels": labels,
+            "sample_ids": torch.arange(sampled_video.shape[0]),
+        },
+        tensor_path,
     )
-    encoder_config = as_mapping(model_config.get("encoder"), "encoder config")
-    encoder_name = str(encoder_config.get("name", ""))
-    if encoder_name != expected_encoder:
-        raise ValueError(f"checkpoint encoder is {encoder_name!r}; expected {expected_encoder!r}")
 
-    decoder_config = dict(as_mapping(model_config.get("decoder"), "decoder config"))
-    decoder_config["init"] = "scratch"
-    decoder_config.pop("checkpoint", None)
-    parameters = decoder_config.get("parameters")
-    if isinstance(parameters, Mapping):
-        parameters = dict(parameters)
-        parameters["attention_backend"] = "sdpa"
-        decoder_config["parameters"] = parameters
-    else:
-        decoder_config["attention_backend"] = "sdpa"
-    model_config["decoder"] = decoder_config
-
-    if has_model_section:
-        config["model"] = model_config
-    else:
-        config.update(model_config)
-    return config
-
-
-def load_ema_weights(model: nn.Module, payload: Mapping[str, Any]) -> None:
-    ema = as_mapping(payload.get("ema"), "checkpoint EMA state")
-    shadow = as_mapping(ema.get("shadow"), "checkpoint EMA weights")
-    trainable = nn.ModuleDict(model.trainable_groups())
-    state = trainable.state_dict()
-    expected = {name for name, value in state.items() if torch.is_floating_point(value)}
-    if set(shadow) != expected:
-        missing = sorted(expected.difference(shadow))
-        unexpected = sorted(set(shadow).difference(expected))
-        raise ValueError(
-            "checkpoint EMA weights do not match the model: "
-            f"missing={missing[:8]}, unexpected={unexpected[:8]}"
-        )
-    for name, value in shadow.items():
-        state[name].copy_(torch.as_tensor(value).to(state[name]))
-
-
-def load_model(variant: str, device: torch.device) -> nn.Module:
-    from vrae.checkpoint import load_checkpoint
-    from vrae.models.autoencoder import VRAE
-    from vrae.paths import ProjectPaths
-
-    expected_encoder, checkpoint_path = VARIANTS[variant]
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
-
-    payload = load_checkpoint(checkpoint_path, map_location="cpu", mmap=True)
-    raw_config = as_mapping(payload.get("resolved_config"), "checkpoint model config")
-    config = prepare_model_config(raw_config, expected_encoder)
-    model = VRAE.from_config(
-        config,
-        project_paths=ProjectPaths(project_root=PROJECT_ROOT),
-    )
-    model.load_state_dict(payload["model"], strict=True)
-    load_ema_weights(model, payload)
-
-    del payload
-    gc.collect()
-    return model.requires_grad_(False).eval().to(device)
-
-
-def load_sample(path: Path, num_frames: int | None = None) -> tuple[torch.Tensor, float]:
-    from vrae.data import VideoReader, resize_center_crop, uint8_to_float
-
-    reader = VideoReader(path, backend="auto", num_threads=1, seek_mode="exact")
-    available_frames = len(reader)
-    if num_frames is None:
-        if available_frames not in SUPPORTED_NUM_FRAMES:
-            supported = " or ".join(str(value) for value in SUPPORTED_NUM_FRAMES)
-            raise ValueError(
-                f"{path} contains {available_frames} frames; expected {supported}"
+    if sampled_video.ndim == 6:
+        # [B,T,V,C,H,W] -> one [T,C,H,W] video per sample/view.
+        for sample_index in range(sampled_video.shape[0]):
+            for view_index in range(sampled_video.shape[2]):
+                save_video_mp4(
+                    sampled_video[sample_index, :, view_index].detach().cpu(),
+                    output_dir / f"sample-{sample_index:04d}-view-{view_index:02d}.mp4",
+                    fps=fps,
+                )
+    elif sampled_video.ndim == 5:
+        # [B,T,C,H,W] -> one video per sample.
+        for sample_index in range(sampled_video.shape[0]):
+            save_video_mp4(
+                sampled_video[sample_index].detach().cpu(),
+                output_dir / f"sample-{sample_index:04d}.mp4",
+                fps=fps,
             )
-        num_frames = available_frames
-    elif available_frames < num_frames:
+    else:
         raise ValueError(
-            f"{path} contains {available_frames} frames; "
-            f"cannot reconstruct {num_frames} frames"
+            "generated video must have shape [B,T,C,H,W] or [B,T,V,C,H,W], "
+            f"got {tuple(sampled_video.shape)}"
         )
 
-    frames = reader.get_frames(range(num_frames))
-    video = resize_center_crop(
-        uint8_to_float(frames),
-        IMAGE_SIZE,
-        mode="bilinear",
-        antialias=True,
-        crop_rounding="round",
-    ).clamp_(0.0, 1.0)
-    fps = float(reader.metadata.fps) if reader.metadata.fps else 30.0
-    return video.contiguous(), fps
-
-
-@torch.inference_mode()
-def reconstruct(model: nn.Module, video: torch.Tensor, device: torch.device) -> torch.Tensor:
-    expected_tail = (3, *IMAGE_SIZE)
-    if video.ndim != 4 or tuple(video.shape[1:]) != expected_tail:
-        raise ValueError(
-            f"sample must have shape [T, {expected_tail[0]}, "
-            f"{expected_tail[1]}, {expected_tail[2]}], got {tuple(video.shape)}"
-        )
-    if video.shape[0] not in SUPPORTED_NUM_FRAMES:
-        supported = " or ".join(str(value) for value in SUPPORTED_NUM_FRAMES)
-        raise ValueError(f"sample must contain {supported} frames, got {video.shape[0]}")
-
-    model_input = video.unsqueeze(0).to(device=device, non_blocking=True)
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        reconstruction = model(model_input)["recon"]
-    if reconstruction.shape != model_input.shape:
-        raise RuntimeError(
-            "reconstruction shape does not match the input: "
-            f"{tuple(reconstruction.shape)} != {tuple(model_input.shape)}"
-        )
-    return reconstruction[0].float().clamp_(0.0, 1.0).cpu()
-
-
-def make_comparison(original: torch.Tensor, reconstruction: torch.Tensor) -> torch.Tensor:
-    from PIL import Image, ImageDraw, ImageFont
-
-    if original.shape != reconstruction.shape:
-        raise ValueError("original and reconstructed videos must have the same shape")
-
-    video = torch.cat((original, reconstruction), dim=-1)
-    width = int(original.shape[-1])
-    header_image = Image.new("RGB", (width * 2, HEADER_HEIGHT), color=(18, 18, 18))
-    draw = ImageDraw.Draw(header_image)
-    font = ImageFont.load_default(size=HEADER_FONT_SIZE)
-    for column, label in enumerate(LABELS):
-        left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
-        text_width = right - left
-        text_height = bottom - top
-        x = column * width + (width - text_width) // 2 - left
-        y = (HEADER_HEIGHT - text_height) // 2 - top
-        draw.text((x, y), label, font=font, fill="white")
-
-    header_array = np.asarray(header_image, dtype=np.uint8).copy()
-    header = torch.from_numpy(header_array).permute(2, 0, 1).float().div_(255.0)
-    header = header.unsqueeze(0).expand(video.shape[0], -1, -1, -1)
-    return torch.cat((header, video), dim=-2).contiguous()
-
-
-def write_video(path: Path, video: torch.Tensor, fps: float) -> None:
-    try:
-        import imageio.v2 as imageio
-    except ImportError as error:
-        raise RuntimeError("saving MP4 files requires imageio and imageio-ffmpeg") from error
-
-    frames = (
-        video.clamp(0.0, 1.0)
-        .mul(255.0)
-        .round()
-        .to(torch.uint8)
-        .permute(0, 2, 3, 1)
-        .contiguous()
-        .numpy()
+    metadata = {
+        "config": str(config_path),
+        "checkpoint": str(checkpoint),
+        "shape": list(sampled_video.shape),
+        "labels": labels.tolist(),
+        "fps": int(fps),
+    }
+    (output_dir / "sampling_metadata.json").write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.stem}.{os.getpid()}.tmp.mp4")
-    try:
-        imageio.mimwrite(
-            str(temporary),
-            frames,
-            fps=fps,
-            codec="libx264",
-            quality=9,
-            macro_block_size=1,
-            pixelformat="yuv420p",
-            output_params=["-movflags", "+faststart"],
-        )
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    print(f"[sampling] saved tensors: {tensor_path}", flush=True)
+    print(f"[sampling] saved videos/metadata: {output_dir}", flush=True)
 
 
 def main() -> int:
     args = parse_args()
-    missing = [path for path in SAMPLES if not path.is_file()]
-    if missing:
-        paths = "\n".join(f"  {path}" for path in missing)
-        raise FileNotFoundError(f"sample video(s) not found:\n{paths}")
-    if not torch.cuda.is_available():
-        raise RuntimeError("sampling requires CUDA")
+    if args.num_samples <= 0:
+        raise ValueError("--num-samples must be positive")
+    if args.steps is not None and args.steps <= 0:
+        raise ValueError("--steps must be positive")
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for the default sampling device")
 
-    device = torch.device("cuda:0")
-    torch.cuda.set_device(device)
-    checkpoint_path = VARIANTS[args.variant][1]
-    print(f"Loading {checkpoint_path} on {device}", flush=True)
-    model = load_model(args.variant, device)
+    from vrae.config import load_config
+    from vrae.paths import find_project_root, load_project_paths
+    from vrae.training.common.engine import (
+        build_flow_transport,
+        generate_class_conditional,
+        load_class_conditional_sampling_stack,
+    )
 
-    output_dir = PROJECT_ROOT / "outputs" / args.variant
-    for index, input_path in enumerate(SAMPLES, start=1):
-        output_path = output_dir / f"{input_path.stem}-comparison.mp4"
-        original, fps = load_sample(input_path, args.num_frames)
-        print(
-            f"[{index}/{len(SAMPLES)}] Reconstructing {input_path.name} "
-            f"({original.shape[0]} frames)",
-            flush=True,
+    config_path = resolve_path(args.config, root=PROJECT_ROOT)
+    config = load_config(config_path)
+    project_root = find_project_root(config_path)
+    paths = load_project_paths(
+        config,
+        override=args.paths,
+        project_root=project_root,
+    )
+    checkpoint = resolve_checkpoint(args.checkpoint, config=config, paths=paths)
+    if not checkpoint.is_file():
+        raise FileNotFoundError(
+            f"checkpoint not found: {checkpoint}; pass --checkpoint explicitly "
+            "or train the configured run first"
         )
-        reconstruction = reconstruct(model, original, device)
-        write_video(output_path, make_comparison(original, reconstruction), fps)
-        print(f"[{index}/{len(SAMPLES)}] Saved {output_path}", flush=True)
-        del original, reconstruction
-        torch.cuda.empty_cache()
 
+    device = torch.device(args.device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda:0")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    print(f"[sampling] config={config_path}", flush=True)
+    print(f"[sampling] checkpoint={checkpoint}", flush=True)
+    print(f"[sampling] device={device}", flush=True)
+
+    stage1, dit, normalizer = load_class_conditional_sampling_stack(
+        config,
+        paths,
+        checkpoint,
+        device,
+    )
+    num_samples = int(args.num_samples)
+    sampling_config = config.get("sampling", {})
+    labels = torch.tensor(
+        parse_labels(
+            args.labels,
+            num_samples=num_samples,
+            num_classes=int(dit.num_classes),
+            default_labels=[int(value) for value in sampling_config.get("class_ids", [])],
+        ),
+        dtype=torch.long,
+    )
+    seed = int(
+        args.seed
+        if args.seed is not None
+        else sampling_config.get("base_seed", 3407)
+    )
+    steps = int(args.steps if args.steps is not None else sampling_config.get("steps", 100))
+    cfg_scale = float(
+        args.cfg_scale
+        if args.cfg_scale is not None
+        else sampling_config.get("cfg_scale", 1.0)
+    )
+    internal_guidance_scale = float(
+        args.internal_guidance_scale
+        if args.internal_guidance_scale is not None
+        else sampling_config.get("internal_guidance_scale", 1.0)
+    )
+    num_chunks = int(config["data"]["num_frames"]) // 4
+    autocast_context = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if device.type == "cuda"
+        else nullcontext()
+    )
+    with torch.inference_mode(), autocast_context:
+        sampled_video = generate_class_conditional(
+            dit,
+            stage1,
+            normalizer,
+            transport=build_flow_transport(config),
+            sample_ids=list(range(num_samples)),
+            labels=labels,
+            base_seed=seed,
+            num_chunks=num_chunks,
+            grid_size=tuple(dit.grid_size),
+            channels=int(dit.in_channels),
+            steps=steps,
+            cfg_scale=cfg_scale,
+            internal_guidance_scale=internal_guidance_scale,
+            internal_guidance_t_min=float(
+                sampling_config.get("internal_guidance_t_min", 0.0)
+            ),
+            internal_guidance_t_max=float(
+                sampling_config.get("internal_guidance_t_max", 1.0)
+            ),
+            device=device,
+        )
+
+    run_dir = checkpoint.parent.parent
+    output_dir = (
+        resolve_path(args.output_dir, root=PROJECT_ROOT)
+        if args.output_dir is not None
+        else run_dir / "samples"
+    )
+    save_outputs(
+        sampled_video,
+        labels,
+        output_dir=output_dir,
+        fps=int(config["data"].get("fps", 10)),
+        checkpoint=checkpoint,
+        config_path=config_path,
+    )
     return 0
 
 

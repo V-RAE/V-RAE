@@ -74,6 +74,12 @@ def save_resolved_config(config: Mapping[str, Any], path: str | Path) -> Path:
 
 
 def validate_config(config: Mapping[str, Any]) -> None:
+    task = str(config.get("task", ""))
+    trainer = config.get("trainer")
+    if task in {"ci2v", "c2v", "ti2v", "t2v"} and trainer not in {None, "libero_videogen"}:
+        raise ConfigError("Video generation tasks require trainer=libero_videogen")
+    if task == "ci2va" and trainer not in {None, "fastwam"}:
+        raise ConfigError("CI2VA requires trainer=fastwam")
     model = config.get("model", config)
     if not isinstance(model, Mapping):
         raise ConfigError("model must be a mapping")
@@ -85,7 +91,7 @@ def validate_config(config: Mapping[str, Any]) -> None:
             raise ConfigError("Only the temporal_attention pooler is registered")
     encoder = model.get("encoder")
     if isinstance(encoder, Mapping) and "name" in encoder:
-        allowed = {"dinov3", "siglip2", "eupe", "vjepa2_1"}
+        allowed = {"vjepa2_1"}
         encoder_name = str(encoder["name"])
         if encoder_name not in allowed:
             raise ConfigError(
@@ -112,18 +118,69 @@ def validate_config(config: Mapping[str, Any]) -> None:
         if backend not in {"sdpa", "fa3", "fa3_fwd", "fa4_cute", "auto"}:
             raise ConfigError(f"Unknown decoder attention backend: {backend}")
         _checkpoint_relative_to_project(decoder.get("checkpoint"), "model.decoder.checkpoint")
+    multiview = model.get("multiview", {})
+    if multiview:
+        if not isinstance(multiview, Mapping):
+            raise ConfigError("model.multiview must be a mapping")
+        num_views = int(multiview.get("num_views", 1))
+        num_streams = int(multiview.get("num_streams", num_views))
+        if num_views <= 0 or num_streams <= 0 or num_views > num_streams:
+            raise ConfigError("model.multiview requires 0 < num_views <= num_streams")
     data = config.get("data", {})
     if isinstance(data, Mapping):
-        video_backend = str(data.get("video_backend", "auto"))
-        if video_backend not in {"auto", "torchcodec"}:
-            raise ConfigError("data.video_backend must be auto or torchcodec")
-        if int(data.get("max_decode_attempts", 128)) <= 0:
-            raise ConfigError("data.max_decode_attempts must be positive")
-        seek_mode = data.get("torchcodec_seek_mode", "approximate")
-        if seek_mode not in {"exact", "approximate"}:
-            raise ConfigError("data.torchcodec_seek_mode must be exact or approximate")
-        if int(data.get("decode_threads", 1)) <= 0:
-            raise ConfigError("data.decode_threads must be positive")
+        if task == "ci2v":
+            if str(data.get("dataset", "")) != "reconstruction":
+                raise ConfigError("CI2V requires data.dataset=reconstruction")
+            num_frames = int(data.get("num_frames", 0))
+            if num_frames != 21:
+                raise ConfigError("CI2V data.num_frames must be 21 (1 condition + 20 target frames)")
+            task_config = config.get("task_config", {})
+            ci2v_config = task_config.get("ci2v", {}) if isinstance(task_config, Mapping) else {}
+            if isinstance(ci2v_config, Mapping):
+                target_frames = ci2v_config.get("video_target", {}).get("frames", num_frames - 1)
+                if int(target_frames) != num_frames - 1:
+                    raise ConfigError("CI2V video_target.frames must equal data.num_frames - 1")
+                decode_frames = ci2v_config.get("sampling", {}).get("decode_frames", num_frames - 1)
+                if int(decode_frames) != num_frames - 1:
+                    raise ConfigError("CI2V sampling.decode_frames must equal data.num_frames - 1")
+        if task == "ci2va":
+            if str(data.get("dataset", "")) != "lerobot":
+                raise ConfigError("CI2VA requires data.dataset=lerobot")
+            num_frames = int(data.get("num_frames", 0))
+            if num_frames <= 1 or (num_frames - 1) % 4:
+                raise ConfigError("CI2VA data.num_frames must satisfy (num_frames - 1) % 4 == 0")
+            action_horizon = int(data.get("action_horizon", num_frames - 1))
+            if action_horizon != num_frames - 1:
+                raise ConfigError("CI2VA data.action_horizon must equal data.num_frames - 1")
+            if str(data.get("output_format", "fastwam")) != "fastwam":
+                raise ConfigError("CI2VA data.output_format must be fastwam")
+        if int(data.get("frame_interval", 1)) <= 0:
+            raise ConfigError("data.frame_interval must be positive")
+        if str(data.get("dataset", "")) == "lerobot":
+            cameras = data.get("camera_keys")
+            if (
+                not isinstance(cameras, Sequence)
+                or isinstance(cameras, (str, bytes))
+                or not cameras
+            ):
+                raise ConfigError("data.camera_keys must be a non-empty list for LeRobot")
+            multiview = model.get("multiview", {}) if isinstance(model, Mapping) else {}
+            enabled = (
+                bool(multiview.get("enabled", len(cameras) > 1))
+                if isinstance(multiview, Mapping)
+                else len(cameras) > 1
+            )
+            if enabled and int(multiview.get("num_views", len(cameras))) != len(cameras):
+                raise ConfigError("model.multiview.num_views must equal len(data.camera_keys)")
+            if any(not isinstance(camera, Mapping) or "key" not in camera for camera in cameras):
+                raise ConfigError("each data.camera_keys entry must be a mapping with key")
+        if str(data.get("dataset", "")) == "lerobot_reconstruction":
+            if not data.get("manifest"):
+                raise ConfigError("data.manifest is required for lerobot_reconstruction")
+            interval_min = int(data.get("frame_interval_min", 1))
+            interval_max = int(data.get("frame_interval_max", 4))
+            if interval_min <= 0 or interval_max < interval_min:
+                raise ConfigError("data.frame_interval_min/max are invalid")
     training = config.get("training", {})
     if isinstance(training, Mapping) and training.get("resume") and training.get("init_from"):
         raise ConfigError("training.resume and training.init_from are mutually exclusive")
@@ -154,25 +211,19 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if not isinstance(data_pipeline, Mapping):
         raise ConfigError("runtime.data_pipeline must be a mapping")
     if data_pipeline:
-        if data_pipeline.get("kind") != "torchcodec_cpu_bounded":
-            raise ConfigError("runtime.data_pipeline.kind must be torchcodec_cpu_bounded")
+        if data_pipeline.get("kind") != "lerobot_bounded":
+            raise ConfigError("runtime.data_pipeline.kind must be lerobot_bounded")
         for key in (
-            "torchcodec_num_ffmpeg_threads",
-            "torchcodec_cpu_decode_threads",
-            "torchcodec_cpu_max_inflight",
-            "torchcodec_cpu_max_buffered_batches",
-            "torchcodec_cpu_async_prefetch_batches",
-            "torchcodec_cpu_max_decode_attempts_per_batch",
-            "torchcodec_cpu_glibc_arena_max",
-            "torchcodec_cpu_glibc_trim_threshold_bytes",
+            "worker_threads",
+            "max_inflight",
+            "max_buffered_batches",
+            "async_prefetch_batches",
+            "max_decode_attempts_per_batch",
+            "glibc_arena_max",
+            "glibc_trim_threshold_bytes",
         ):
             if int(data_pipeline.get(key, 1)) <= 0:
                 raise ConfigError(f"runtime.data_pipeline.{key} must be positive")
-        seek_mode = data_pipeline.get("torchcodec_seek_mode", "approximate")
-        if seek_mode not in {"exact", "approximate"}:
-            raise ConfigError(
-                "runtime.data_pipeline.torchcodec_seek_mode must be exact or approximate"
-            )
     host_memory = runtime.get("host_memory", {})
     if not isinstance(host_memory, Mapping):
         raise ConfigError("runtime.host_memory must be a mapping")
@@ -209,12 +260,6 @@ def validate_config(config: Mapping[str, Any]) -> None:
         _checkpoint_relative_to_project(
             loss.get("calibration_checkpoint"),
             "loss.calibration_checkpoint",
-        )
-    gan = config.get("gan", {})
-    if isinstance(gan, Mapping):
-        _checkpoint_relative_to_project(
-            gan.get("discriminator_checkpoint"),
-            "gan.discriminator_checkpoint",
         )
 
 

@@ -1,1 +1,1 @@
-"""Seven protocol-locked V-RAE evaluations."""
+"""V-RAE video reconstruction evaluation."""

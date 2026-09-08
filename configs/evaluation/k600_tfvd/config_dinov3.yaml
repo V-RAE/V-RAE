@@ -1,7 +1,0 @@
-include: config.yaml
-
-run:
-  name: k600-tfvd-dinov3-dt3
-
-checkpoints:
-  stage1: ckpts/vrae/vrae_dinov3.pt

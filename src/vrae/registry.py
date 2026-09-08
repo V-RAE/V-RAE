@@ -42,16 +42,12 @@ DIT_MODELS: Registry[Any] = Registry("DiT model")
 
 
 def register_builtin_models() -> None:
-    # Imports are local to keep optional encoder dependencies lazy.
+    # Imports are local to keep the V-JEPA runtime dependency lazy.
     modules = (
         "vrae.models.autoencoder",
         "vrae.models.decoder",
         "vrae.models.pooling",
         "vrae.models.dit.video_dit",
-        "vrae.models.dit.video_prediction_dit",
-        "vrae.models.encoders.dinov3",
-        "vrae.models.encoders.eupe",
-        "vrae.models.encoders.siglip2",
         "vrae.models.encoders.vjepa2_1",
     )
     for module in modules:

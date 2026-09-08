@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import os
 import random
-import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -99,6 +98,21 @@ def flow_transport_metadata(config: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def flatten_multiview_video(video: torch.Tensor) -> torch.Tensor:
+    """Keep the training model single-view by folding [B,T,V] into [B*V,T]."""
+
+    if video.ndim == 5:
+        return video
+    if video.ndim != 6:
+        raise ValueError(f"Expected [B,T,C,H,W] or [B,T,V,C,H,W], got {tuple(video.shape)}")
+    batch, time, views, channels, height, width = video.shape
+    return (
+        video.permute(0, 2, 1, 3, 4, 5)
+        .reshape(batch * views, time, channels, height, width)
+        .contiguous()
+    )
+
+
 def _training_progress_line(
     *,
     task: str,
@@ -163,7 +177,9 @@ def prepare_run(
         override=paths_path,
         project_root=find_project_root(config_path),
     )
-    run = paths.training_run(str(config["task"]), str(config["run_name"]), create=False)
+    task = str(config["task"])
+    run_task = "libero_videogen" if task in {"c2v", "ci2v"} else task
+    run = paths.training_run(run_task, str(config["run_name"]), create=False)
     root_error: Exception | None = None
     failure: dict[str, str] | None = None
     if distributed.is_main:
@@ -233,126 +249,51 @@ def prepare_run(
 
 
 class ClassConditionalVideoDataset:
-    """Factory namespace for the shared UCF101/K600 preprocessing contract."""
+    """Build the LeRobot dataset used by class-conditional LIBERO training."""
 
     @staticmethod
     def build(config: Mapping[str, Any], paths: ProjectPaths, dataset_name: str):
-        from vrae.data.datasets import Kinetics600Dataset, UCF101Dataset
-        from vrae.data.transforms import random_crop_video, resize_short_side
-
         data = config["data"]
-        runtime = config.get("runtime", {})
-        if not isinstance(runtime, Mapping):
-            raise TypeError("runtime configuration must be a mapping")
-        pipeline = runtime.get("data_pipeline", {})
-        if not isinstance(pipeline, Mapping):
-            raise TypeError("runtime.data_pipeline configuration must be a mapping")
-        pipeline_kind = str(pipeline.get("kind", "torchcodec_cpu_bounded"))
-        if pipeline_kind != "torchcodec_cpu_bounded":
-            raise ValueError(
-                "Class-conditional training only supports runtime.data_pipeline.kind="
-                "torchcodec_cpu_bounded"
+        root_value = data.get("root")
+        root = Path(str(root_value)).expanduser() if root_value else paths.dataset("lerobot")
+        if dataset_name == "reconstruction":
+            from vrae.data.reconstruction import LiberoVideoDataset
+
+            manifest = data.get("manifest")
+            if not manifest:
+                raise ValueError("Reconstruction generation requires data.manifest")
+            manifest_path = Path(str(manifest))
+            if not manifest_path.is_absolute():
+                manifest_path = paths.project_root / manifest_path
+            return LiberoVideoDataset(
+                root,
+                manifest_path,
+                repo_id=str(data.get("repo_id", "libero")),
+                num_frames=int(data["num_frames"]),
+                view_key=(str(data["view_key"]) if data.get("view_key") else None),
+                camera_keys=data.get("camera_keys"),
+                frame_interval=int(data.get("frame_interval", 3)),
+                random_frame_interval=bool(data.get("random_frame_interval", False)),
+                frame_interval_min=int(data.get("frame_interval_min", 1)),
+                frame_interval_max=int(data.get("frame_interval_max", 4)),
+                image_size=int(data.get("image_size", 256)),
+                random_flip=bool(data.get("random_flip", True)),
+                seed=int(data.get("seed", 3407)),
+                task=str(config.get("task", "reconstruction")),
             )
-        root = paths.dataset(dataset_name)
-        manifest_value = data.get("manifest")
-        manifest_scope = str(data.get("manifest_scope", "dataset"))
-        if manifest_scope not in {"dataset", "project"}:
-            raise ValueError("manifest_scope must be dataset or project")
-        if not manifest_value and "manifest_scope" in data:
-            raise ValueError("manifest_scope requires a non-empty manifest")
-        manifest = Path(str(manifest_value)) if manifest_value else None
-        if manifest is not None and not manifest.is_absolute():
-            manifest_base = root if manifest_scope == "dataset" else paths.project_root
-            manifest = manifest_base / manifest
-        manifest_split = data.get("manifest_split", data.get("split", "train"))
-        dataset_class = UCF101Dataset if dataset_name == "ucf101" else Kinetics600Dataset
+        if dataset_name != "lerobot":
+            raise ValueError(
+                "class-conditional training only supports dataset_name='lerobot' or 'reconstruction'"
+            )
 
-        class ProcessedDataset(dataset_class):
-            def __init__(
-                self,
-                *args: Any,
-                max_decode_attempts: int,
-                **kwargs: Any,
-            ) -> None:
-                super().__init__(*args, **kwargs)
-                self.max_decode_attempts = int(max_decode_attempts)
-                if self.max_decode_attempts <= 0:
-                    raise ValueError("max_decode_attempts must be positive")
-                self._bad_video_paths: set[str] = set()
-                self._bad_video_paths_lock = threading.Lock()
+        from vrae.data.lerobot import LeRobotVideoDataset
 
-            def set_epoch(self, epoch: int) -> None:
-                if int(epoch) != self.epoch:
-                    with self._bad_video_paths_lock:
-                        self._bad_video_paths.clear()
-                super().set_epoch(epoch)
-
-            def __getitem__(self, index: int) -> dict[str, Any]:
-                requested_index = int(index)
-                if requested_index < 0 or requested_index >= len(self.records):
-                    raise IndexError(requested_index)
-                attempts = min(len(self.records), self.max_decode_attempts)
-                last_error: Exception | None = None
-                for attempt in range(attempts):
-                    candidate_index = (requested_index + attempt) % len(self.records)
-                    candidate_path = str(self.records[candidate_index].path)
-                    with self._bad_video_paths_lock:
-                        is_bad = candidate_path in self._bad_video_paths
-                    if is_bad:
-                        continue
-                    try:
-                        generator = self._generator(requested_index, attempt=attempt)
-                        item = super().__getitem__(candidate_index, generator=generator)
-                        video = item["video"]
-                        if bool(data.get("random_flip", True)) and bool(
-                            torch.rand((), generator=generator) < 0.5
-                        ):
-                            video = video.flip(-1)
-                        video = resize_short_side(
-                            video,
-                            int(data.get("image_size", 256)),
-                            mode="bilinear",
-                            antialias=False,
-                        )
-                        item["video"] = random_crop_video(
-                            video,
-                            int(data.get("image_size", 256)),
-                            generator=generator,
-                        )
-                    except Exception as error:
-                        with self._bad_video_paths_lock:
-                            self._bad_video_paths.add(candidate_path)
-                        last_error = error
-                        continue
-                    item["decode_attempts"] = attempt + 1
-                    return item
-                message = (
-                    f"No video could be decoded for logical sample {requested_index} after "
-                    f"{attempts} attempts"
-                )
-                if last_error is None:
-                    raise RuntimeError(message)
-                raise RuntimeError(message) from last_error
-
-        return ProcessedDataset(
+        return LeRobotVideoDataset(
             root,
-            manifest=manifest,
-            split=None if manifest_split is None else str(manifest_split),
-            clip_length=int(data["num_frames"]),
+            repo_id=str(data.get("repo_id", "libero")),
+            frame_num=int(data["num_frames"]),
             frame_interval=int(data.get("frame_interval", 1)),
-            sampling=str(data.get("sampling", "random")),
-            backend="torchcodec",
-            base_seed=int(data.get("seed", 3407)),
-            num_threads=int(
-                pipeline.get("torchcodec_num_ffmpeg_threads", data.get("decode_threads", 1))
-            ),
-            seek_mode=str(
-                pipeline.get(
-                    "torchcodec_seek_mode",
-                    data.get("torchcodec_seek_mode", "approximate"),
-                )
-            ),
-            max_decode_attempts=int(data.get("max_decode_attempts", 128)),
+            camera_keys=data.get("camera_keys"),
         )
 
 
@@ -378,25 +319,25 @@ def _build_bounded_thread_loader(
         dataset=dataset,
         batch_sampler=batch_sampler,
         rank=rank,
-        decode_threads=int(pipeline.get("torchcodec_cpu_decode_threads", 8)),
-        max_inflight=int(pipeline.get("torchcodec_cpu_max_inflight", 32)),
-        max_buffered_batches=int(pipeline.get("torchcodec_cpu_max_buffered_batches", 4)),
+        decode_threads=int(pipeline.get("worker_threads", 8)),
+        max_inflight=int(pipeline.get("max_inflight", 32)),
+        max_buffered_batches=int(pipeline.get("max_buffered_batches", 4)),
         max_decode_attempts_per_batch=int(
-            pipeline.get("torchcodec_cpu_max_decode_attempts_per_batch", 2048)
+            pipeline.get("max_decode_attempts_per_batch", 2048)
         ),
-        pin_memory=bool(pipeline.get("torchcodec_cpu_pin_memory", True)),
-        glibc_arena_max=int(pipeline.get("torchcodec_cpu_glibc_arena_max", 2)),
+        pin_memory=bool(pipeline.get("pin_memory", True)),
+        glibc_arena_max=int(pipeline.get("glibc_arena_max", 2)),
         glibc_trim_threshold_bytes=int(
-            pipeline.get("torchcodec_cpu_glibc_trim_threshold_bytes", 128 * 1024**2)
+            pipeline.get("glibc_trim_threshold_bytes", 128 * 1024**2)
         ),
-        trim_heap_each_epoch=bool(pipeline.get("torchcodec_cpu_trim_heap_each_epoch", True)),
+        trim_heap_each_epoch=bool(pipeline.get("trim_heap_each_epoch", True)),
         collect_python_each_epoch=bool(
-            pipeline.get("torchcodec_cpu_collect_python_each_epoch", False)
+            pipeline.get("collect_python_each_epoch", False)
         ),
     )
     return AsyncPrefetchLoader(
         core,
-        prefetch_batches=int(pipeline.get("torchcodec_cpu_async_prefetch_batches", 2)),
+        prefetch_batches=int(pipeline.get("async_prefetch_batches", 2)),
     )
 
 
@@ -433,6 +374,15 @@ def build_class_conditional_loader(
     return loader, sampler
 
 
+def _generation_num_chunks(config: Mapping[str, Any]) -> int:
+    num_frames = int(config["data"]["num_frames"])
+    if config.get("task") == "ci2v":
+        if num_frames != 21:
+            raise ValueError("CI2V requires data.num_frames=21")
+        return 1 + (num_frames - 1) // 4
+    return num_frames // 4
+
+
 def load_frozen_stage1(config: Mapping[str, Any], paths: ProjectPaths, device: torch.device):
     from vrae.training.common.contracts import STAGE1_WEIGHT_COMPATIBILITY_FIELDS
     from vrae.training.common.ema import ExponentialMovingAverage
@@ -465,6 +415,12 @@ def load_frozen_stage1(config: Mapping[str, Any], paths: ProjectPaths, device: t
     ), payload
 
 
+def episode_start_indices(dataset: Any) -> list[int]:
+    """Select the first valid clip index from each LeRobot episode."""
+
+    return [int(episode["dataset_from_index"]) for episode in dataset.meta.episodes]
+
+
 def compute_class_conditional_latent_stats(
     config: Mapping[str, Any],
     paths: ProjectPaths,
@@ -482,7 +438,12 @@ def compute_class_conditional_latent_stats(
     # checkpoint state for the lifetime of the training process.
     del stage1_checkpoint_payload
     dataset = ClassConditionalVideoDataset.build(config, paths, dataset_name)
-    local_indices = list(range(context.rank, len(dataset), context.world_size))
+    if dataset_name == "reconstruction":
+        # LiberoVideoDataset indexes one sampled clip per valid episode.
+        clip_indices = list(range(len(dataset)))
+    else:
+        clip_indices = episode_start_indices(dataset)
+    local_indices = clip_indices[context.rank :: context.world_size]
     global_batch = int(config["training"]["global_batch_size"])
     if global_batch <= 0:
         raise ValueError("training.global_batch_size must be positive")
@@ -521,7 +482,19 @@ def compute_class_conditional_latent_stats(
                 video = batch["video"].to(context.device, non_blocking=True)
                 if video.dtype == torch.uint8:
                     video = video.float().div_(255.0)
-                stats.update(stage1.encode_grid(video))
+                if config.get("task") == "ci2v":
+                    image = video[:, :1]
+                    target = video[:, 1:]
+                    if image.dtype == torch.uint8:
+                        image = image.float().div_(255.0)
+                    if target.dtype == torch.uint8:
+                        target = target.float().div_(255.0)
+                    image = flatten_multiview_video(image).repeat_interleave(4, dim=1)
+                    target = flatten_multiview_video(target)
+                    stats.update(stage1.encode_grid(image))
+                    stats.update(stage1.encode_grid(target))
+                else:
+                    stats.update(stage1.encode_grid(flatten_multiview_video(video)))
                 progress.update(1)
     finally:
         progress.close()
@@ -533,10 +506,23 @@ def compute_class_conditional_latent_stats(
         "stage1_checkpoint": str(config["stage1"]["checkpoint"]),
         "dataset": dataset_name,
         "split": str(config["data"].get("split", "train")),
-        "scope": "all_frames",
+        "scope": (
+            "target_and_repeated_first_frame"
+            if config.get("task") == "ci2v"
+            else "one_clip_per_episode"
+        ),
         "clean_latent": True,
         "normalized": False,
         "clean_latents": True,
+        **(
+            {
+                "condition_temporal_lift": "repeat_4",
+                "target_frames": 20,
+                "latent_frames": 5,
+            }
+            if config.get("task") == "ci2v"
+            else {}
+        ),
     }
     normalizer = stats.finalize(metadata=metadata)
     if context.is_main:
@@ -566,7 +552,7 @@ def load_class_conditional_sampling_stack(
     if stage1_checkpoint_override is not None:
         stage1_config["stage1"]["checkpoint"] = str(stage1_checkpoint_override)
     stage1, _ = load_frozen_stage1(stage1_config, paths, device)
-    chunks = int(config["data"]["num_frames"]) // 4
+    chunks = _generation_num_chunks(config)
     dit = build_class_conditional_dit(config, stage1.metadata(), num_chunks=chunks).to(device)
     normalizer_path = paths.checkpoint(
         latent_normalizer_override
@@ -579,8 +565,12 @@ def load_class_conditional_sampling_stack(
         stage1_metadata=stage1.metadata(),
         stage1_checkpoint=str(config["stage1"]["checkpoint"]),
         dataset=str(config["data"]["dataset"]),
-        split="train",
-        scope="all_frames",
+        split=str(config["data"].get("split", "train")),
+        scope=(
+            "target_and_repeated_first_frame"
+            if config.get("task") == "ci2v"
+            else "one_clip_per_episode"
+        ),
     )
     payload = load_checkpoint(paths.checkpoint(checkpoint))
     expected_metadata = class_conditional_metadata(config, stage1.metadata(), dit, normalizer)
@@ -609,6 +599,16 @@ def build_class_conditional_dit(
     patch = int(stage1_metadata["patch_size"])
     grid = (int(image_size[0]) // patch, int(image_size[1]) // patch)
     dit_config = dict(config["dit"])
+    # CI2V uses clean-mask conditioning; these descriptive config fields are
+    # not constructor arguments of the current VideoDiT implementation.
+    dit_config.pop("image_condition", None)
+    dit_config.pop("image_condition_injection", None)
+    multiview = config.get("model", {}).get("multiview", {})
+    if isinstance(multiview, Mapping):
+        dit_config.setdefault("multiview_enabled", bool(multiview.get("enabled", False)))
+        for key in ("num_views",):
+            if key in multiview:
+                dit_config.setdefault(key, multiview[key])
     dit_config.pop("input_dim", None)
     return DIT_MODELS.build(
         dit_config,
@@ -637,6 +637,9 @@ def class_conditional_metadata(
         "dit_num_chunks": int(dit.num_chunks),
         "dit_grid_size": list(dit.grid_size),
         "dit_num_classes": int(dit.num_classes),
+        "dit_multiview_enabled": bool(getattr(dit, "multiview_enabled", False)),
+        "dit_num_views": int(getattr(dit, "num_views", 1)),
+        "dit_num_streams": int(getattr(dit, "num_streams", 1)),
         **dit_architecture_metadata(dit),
         "transport": flow_transport_metadata(config),
         "latent_normalizer_identity": (
@@ -680,14 +683,34 @@ def train_class_conditional(
     )
     from vrae.training.common.optim import build_optimizer, build_scheduler
     from vrae.training.common.precision import PrecisionPolicy
-    from vrae.training.common.visualization import save_sample_tensors
+    from vrae.training.common.profiler import TrainingProfiler, save_profile_json
+    from vrae.training.common.visualization import save_sample_tensors, video_to_uint8
     from vrae.training.common.wandb import WandbLogger
 
     context = initialize_distributed()
     seed_everything(int(config["data"].get("seed", 3407)), rank=context.rank)
     stage1, stage1_checkpoint_payload = load_frozen_stage1(config, paths, context.device)
     del stage1_checkpoint_payload
-    num_chunks = int(config["data"]["num_frames"]) // 4
+    loader, sampler = build_class_conditional_loader(
+        config,
+        paths,
+        dataset_name=dataset_name,
+        rank=context.rank,
+        world_size=context.world_size,
+    )
+    class_map_path = run / "class_map.json"
+    if context.is_main and not class_map_path.is_file():
+        loader.dataset.save_class_map(class_map_path)
+    barrier()
+    class_map = loader.dataset.load_class_map(class_map_path)
+    map_num_classes = int(class_map.get("num_classes", len(class_map["class_names"])))
+    if map_num_classes != len(class_map["class_names"]):
+        raise ValueError("class_map.json has an inconsistent num_classes field")
+    if map_num_classes != loader.dataset.num_classes:
+        raise ValueError("class_map.json does not match the dataset metadata")
+    if map_num_classes != int(config["dit"]["num_classes"]):
+        raise ValueError("dit.num_classes must match the dataset class map")
+    num_chunks = _generation_num_chunks(config)
     dit = build_class_conditional_dit(config, stage1.metadata(), num_chunks=num_chunks).to(
         context.device
     )
@@ -716,8 +739,12 @@ def train_class_conditional(
         stage1_metadata=stage1.metadata(),
         stage1_checkpoint=str(config["stage1"]["checkpoint"]),
         dataset=dataset_name,
-        split="train",
-        scope="all_frames",
+        split=str(config["data"].get("split", "train")),
+        scope=(
+            "target_and_repeated_first_frame"
+            if config.get("task") == "ci2v"
+            else "one_clip_per_episode"
+        ),
     )
     metadata = class_conditional_metadata(config, stage1.metadata(), dit, normalizer)
     optimizer = build_optimizer(dit.parameters(), config["training"]["optimizer"])
@@ -727,13 +754,7 @@ def train_class_conditional(
     )
     scaler = precision.make_scaler()
     transport = build_flow_transport(config)
-    loader, sampler = build_class_conditional_loader(
-        config,
-        paths,
-        dataset_name=dataset_name,
-        rank=context.rank,
-        world_size=context.world_size,
-    )
+    metadata["dit_class_names"] = list(class_map["class_names"])
     accumulation = GradientAccumulator(
         int(config["training"].get("gradient_accumulation_steps", 1))
     )
@@ -768,7 +789,7 @@ def train_class_conditional(
                 "data_pipeline_kind": str(
                     config.get("runtime", {})
                     .get("data_pipeline", {})
-                    .get("kind", "torchcodec_cpu_bounded")
+                    .get("kind", "lerobot_bounded")
                 ),
                 "data_decode_threads": int(
                     getattr(getattr(loader, "loader", None), "decode_threads", 0)
@@ -779,7 +800,7 @@ def train_class_conditional(
                 "data_max_buffered_batches": int(
                     getattr(getattr(loader, "loader", None), "max_buffered_batches", 0)
                 ),
-                "torchcodec_seek_mode": loader.dataset.seek_mode,
+                "data_backend": "lerobot",
             },
         )
         wandb_run_id = str(load_run_metadata(run)["wandb_run_id"])
@@ -791,11 +812,23 @@ def train_class_conditional(
     resume_path = config["training"].get("resume")
     metadata_fields = tuple(metadata)
     if init_path:
+        init_metadata_fields = metadata_fields
+        if config.get("task") == "ci2v":
+            init_metadata_fields = tuple(
+                field
+                for field in metadata_fields
+                if field
+                not in {
+                    "dit_num_chunks",
+                    "latent_normalizer_source",
+                    "latent_normalizer_identity",
+                }
+            )
         load_model_init(
             paths.checkpoint(init_path),
             dit,
             expected_metadata=metadata,
-            metadata_fields=metadata_fields,
+            metadata_fields=init_metadata_fields,
         )
     if resume_path:
         resume_checkpoint = paths.checkpoint(resume_path)
@@ -848,70 +881,251 @@ def train_class_conditional(
     runtime = config.get("runtime", {})
     checkpoint_runtime = runtime.get("checkpoint", {})
     host_memory_runtime = runtime.get("host_memory", {})
+    profile_runtime = runtime.get("profile", {})
     checkpoint_drop_page_cache = bool(checkpoint_runtime.get("drop_page_cache", False))
     log_host_memory = bool(host_memory_runtime.get("log", False))
     min_host_available_gb = float(host_memory_runtime.get("min_available_gb", 0.0))
     if min_host_available_gb < 0.0:
         raise ValueError("runtime.host_memory.min_available_gb must be non-negative")
 
+    profile_warmup_steps = int(profile_runtime.get("warmup_steps", 20))
+    profile_interval_steps = int(
+        profile_runtime.get("interval_steps", config["wandb"]["log_interval"])
+    )
+    if profile_warmup_steps < 0:
+        raise ValueError("runtime.profile.warmup_steps must be non-negative")
+    if profile_interval_steps <= 0:
+        raise ValueError("runtime.profile.interval_steps must be positive")
+    profile_output_path = Path(str(profile_runtime.get("output_file", "profile.json")))
+    if not profile_output_path.is_absolute():
+        profile_output_path = run / profile_output_path
+
     epochs = int(config["training"].get("epochs", 1))
     last_saved_step = step
     stop = False
     memory_guard_message: str | None = None
-    data_wait_seconds = 0.0
-    data_wait_max_seconds = 0.0
-    data_wait_batches = 0
-    throughput_window_started_at = time.perf_counter()
-    throughput_window_updates = 0
-    cuda_batch_events: list[tuple[torch.cuda.Event, ...]] = []
-    cuda_update_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+    profiler = TrainingProfiler(
+        context.device,
+        gpu_util_enabled=profile_runtime.get("gpu_util") if isinstance(profile_runtime, Mapping) else None,
+        gpu_util_interval_seconds=(
+            float(profile_runtime.get("gpu_util_interval_seconds", 0.2))
+            if isinstance(profile_runtime, Mapping)
+            else 0.2
+        ),
+        synchronize_phases=(
+            bool(profile_runtime.get("synchronize_phases", False))
+            if isinstance(profile_runtime, Mapping)
+            else False
+        ),
+    )
+
+    # Profile only the four large phases. Small module wrappers add overhead
+    # and make the timing report harder to interpret.
+    profiler.register_phase("data.loading", gpu_util=True)
+
+    @profiler("stage1", gpu_util=True)
+    def run_stage1(flat_video: torch.Tensor, *, multiview: bool, views: int):
+        with torch.no_grad():
+            flat_grid = stage1.encode_grid(flat_video)
+            flat_tokens = stage1.grid_to_tokens(flat_grid)
+            if multiview:
+                batch_size, _, tokens, channels = flat_tokens.shape
+                clean = flat_tokens.reshape(
+                    batch_size // views,
+                    views,
+                    flat_tokens.shape[1],
+                    tokens,
+                    channels,
+                ).permute(0, 2, 1, 3, 4).contiguous()
+            else:
+                clean = flat_tokens
+            return normalizer.normalize(clean)
+
+    def run_ci2v_stage1(
+        image_condition: torch.Tensor,
+        video_target: torch.Tensor,
+        *,
+        multiview: bool,
+        views: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        image = flatten_multiview_video(image_condition)
+        image = image.repeat_interleave(4, dim=1)
+        target = flatten_multiview_video(video_target)
+        image_clean = run_stage1(image, multiview=multiview, views=views)
+        target_clean = run_stage1(target, multiview=multiview, views=views)
+        return image_clean, target_clean
+
+    @profiler("dit.forward", gpu_util=True)
+    def run_dit_forward(
+        clean: torch.Tensor,
+        labels: torch.Tensor,
+        stream_ids: torch.Tensor | None,
+        clean_mask: torch.Tensor,
+    ):
+        with precision.autocast():
+            losses = transport.training_losses(
+                model,
+                clean,
+                clean_mask=clean_mask,
+                model_kwargs={
+                    "labels": labels,
+                    **(
+                        {"stream_ids": stream_ids}
+                        if stream_ids is not None
+                        else {}
+                    ),
+                },
+            )
+            loss = losses["loss"]
+        return losses, loss
+
+    @profiler("dit.backward", gpu_util=True)
+    def run_dit_backward(loss: torch.Tensor):
+        accumulation.backward(loss, scaler)
+
+    profile_average_metrics: dict[str, float] = {}
+    profile_metric_counts: dict[str, int] = {}
+
+    def nest_profile_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
+        """Expand ``namespace/path.with.dots`` names into nested JSON objects."""
+
+        nested: dict[str, Any] = {}
+        for name, value in metrics.items():
+            parts = str(name).split("/", 1)
+            path = parts[0].split(".")
+            if len(parts) == 2:
+                path.extend(parts[1].split("."))
+            target = nested
+            for part in path[:-1]:
+                child = target.get(part)
+                if not isinstance(child, dict):
+                    child = {}
+                    target[part] = child
+                target = child
+            target[path[-1]] = value
+        return nested
+
+    def write_profile_report() -> None:
+        if not context.is_main:
+            return
+        save_profile_json(
+            {
+                "version": 2,
+                "run_name": str(config["run_name"]),
+                "warmup_steps": profile_warmup_steps,
+                "interval_steps": profile_interval_steps,
+                "average_metrics": nest_profile_metrics(profile_average_metrics),
+            },
+            profile_output_path,
+        )
+
+    def update_profile_average(metrics: Mapping[str, Any]) -> None:
+        for name, value in metrics.items():
+            if isinstance(value, (int, float)):
+                count = profile_metric_counts.get(name, 0) + 1
+                previous = profile_average_metrics.get(name, 0.0)
+                profile_average_metrics[name] = previous + (
+                    float(value) - previous
+                ) / count
+                profile_metric_counts[name] = count
+
+    def profiled_batches():
+        iterator = iter(loader)
+        while True:
+            profiler.begin_phase("data.loading")
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                profiler.end_phase("data.loading")
+                return
+            except BaseException:
+                profiler.end_phase("data.loading")
+                raise
+            profiler.end_phase("data.loading")
+            yield batch
+
+    reset_data_profile = getattr(loader, "profile_snapshot", None)
+    if callable(reset_data_profile):
+        reset_data_profile(reset=True)
+    profiler.start()
+    write_profile_report()
+    training_started_at = time.perf_counter()
+    train_window_started_at = time.perf_counter()
+    train_window_updates = 0
+    profile_window_started_at = time.perf_counter()
+    profile_window_updates = 0
     for epoch in range(start_epoch, epochs):
-        loader.dataset.set_epoch(epoch)
+        epoch_started_at = time.perf_counter()
+        if context.is_main:
+            print(
+                f"[epoch-start] epoch={epoch} step={step} steps_per_epoch={steps_per_epoch}",
+                flush=True,
+            )
+        set_epoch = getattr(loader.dataset, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
         batch_requested_at = time.perf_counter()
-        for batch in loader:
+        for batch in profiled_batches():
             batch_received_at = time.perf_counter()
             data_wait = batch_received_at - batch_requested_at
-            data_wait_seconds += data_wait
-            data_wait_max_seconds = max(data_wait_max_seconds, data_wait)
-            data_wait_batches += 1
+            profiler.record_data_wait(data_wait)
             if accumulation.is_first_microstep:
                 optimizer.zero_grad(set_to_none=True)
-            if context.device.type == "cuda":
-                transfer_started = torch.cuda.Event(enable_timing=True)
-                transfer_finished = torch.cuda.Event(enable_timing=True)
-                stage1_finished = torch.cuda.Event(enable_timing=True)
-                backward_finished = torch.cuda.Event(enable_timing=True)
-                transfer_started.record()
+            profiler.begin_batch()
             video = batch["video"].to(context.device, non_blocking=True)
             if video.dtype == torch.uint8:
                 video = video.float().div_(255.0)
+            input_has_views = video.ndim == 6
+            multiview = input_has_views and bool(getattr(dit, "multiview_enabled", False))
+            views = int(video.shape[2]) if input_has_views else 1
             labels = batch["label"].to(context.device, non_blocking=True)
-            if context.device.type == "cuda":
-                transfer_finished.record()
-            with torch.no_grad():
-                grid = stage1.encode_grid(video)
-                clean = normalizer.normalize(stage1.grid_to_tokens(grid))
-            if context.device.type == "cuda":
-                stage1_finished.record()
-            with accumulation.sync_context(model):
-                with precision.autocast():
-                    losses = transport.training_losses(
-                        model,
-                        clean,
-                        model_kwargs={"labels": labels},
-                    )
-                    loss = losses["loss"]
-                accumulation.backward(loss, scaler)
-            if context.device.type == "cuda":
-                backward_finished.record()
-                cuda_batch_events.append(
-                    (
-                        transfer_started,
-                        transfer_finished,
-                        stage1_finished,
-                        backward_finished,
-                    )
+            if not multiview and views > 1:
+                labels = labels.repeat_interleave(views)
+            stream_ids = batch.get("stream_ids")
+            if multiview and stream_ids is not None:
+                stream_ids = stream_ids.to(context.device, non_blocking=True)
+            else:
+                stream_ids = None
+            clean_mask = batch.get("clean_mask")
+            if clean_mask is None:
+                clean_mask = torch.zeros(
+                    video.shape[0],
+                    _generation_num_chunks(config),
+                    dtype=torch.bool,
+                    device=context.device,
                 )
+            else:
+                clean_mask = clean_mask.to(context.device, non_blocking=True)
+            if not multiview and views > 1:
+                clean_mask = clean_mask.repeat_interleave(views, dim=0)
+            profiler.finish_h2d()
+            if config.get("task") == "ci2v":
+                image_condition = video[:, :1]
+                video_target = video[:, 1:]
+                if image_condition.dtype == torch.uint8:
+                    image_condition = image_condition.float().div_(255.0)
+                if video_target.dtype == torch.uint8:
+                    video_target = video_target.float().div_(255.0)
+                image_clean, target_clean = run_ci2v_stage1(
+                    image_condition,
+                    video_target,
+                    multiview=multiview,
+                    views=views,
+                )
+                clean = torch.cat((image_clean, target_clean), dim=1)
+            else:
+                flat_video = flatten_multiview_video(video)
+                clean = run_stage1(flat_video, multiview=multiview, views=views)
+            profiler.finish_stage1()
+            with accumulation.sync_context(model):
+                losses, loss = run_dit_forward(
+                    clean,
+                    labels,
+                    stream_ids,
+                    clean_mask,
+                )
+                run_dit_backward(loss)
+            profiler.finish_backward()
             sampler.commit_batch()
             if not accumulation.advance():
                 batch_requested_at = time.perf_counter()
@@ -926,17 +1140,19 @@ def train_class_conditional(
                 continue
             scheduler.step()
             ema.update(dit)
-            if context.device.type == "cuda":
-                update_finished = torch.cuda.Event(enable_timing=True)
-                update_finished.record()
-                cuda_update_events.append((backward_finished, update_finished))
+            profiler.finish_update()
             step += 1
-            throughput_window_updates += 1
+            train_window_updates += 1
+            if step > profile_warmup_steps:
+                profile_window_updates += 1
             log_interval = int(config["wandb"]["log_interval"])
-            if step % log_interval == 0:
-                if context.device.type == "cuda":
-                    torch.cuda.synchronize(context.device)
-                window_seconds = time.perf_counter() - throughput_window_started_at
+            loss_log_due = step % log_interval == 0
+            profile_due = (
+                step > profile_warmup_steps
+                and step % profile_interval_steps == 0
+            )
+            if loss_log_due:
+                train_window_seconds = time.perf_counter() - train_window_started_at
                 reduced_losses = reduce_mean(
                     torch.stack(
                         (
@@ -947,94 +1163,47 @@ def train_class_conditional(
                     ).detach()
                 )
                 reduced_loss, reduced_loss_full, reduced_loss_base = reduced_losses.unbind()
-                timing_sum_count = torch.tensor(
-                    [data_wait_seconds, float(data_wait_batches)],
-                    dtype=torch.float64,
-                    device=context.device,
+                train_updates_per_second = train_window_updates / max(
+                    train_window_seconds, 1.0e-9
                 )
-                timing_max = torch.tensor(
-                    [data_wait_max_seconds, window_seconds],
-                    dtype=torch.float64,
-                    device=context.device,
+                train_ms_per_step = 1000.0 / train_updates_per_second
+            else:
+                reduced_loss = None
+                reduced_loss_full = None
+                reduced_loss_base = None
+                train_updates_per_second = None
+                train_ms_per_step = None
+            if profile_due:
+                profile_window_seconds = time.perf_counter() - profile_window_started_at
+                profile_metrics = profiler.summarize(
+                    window_seconds=profile_window_seconds,
+                    updates=profile_window_updates,
+                    global_batch_size=batch_contract.global_batch_size,
                 )
-                if cuda_batch_events:
-                    profile_values = torch.tensor(
-                        [
-                            sum(
-                                start.elapsed_time(copied)
-                                for start, copied, _, _ in cuda_batch_events
-                            ),
-                            sum(
-                                copied.elapsed_time(encoded)
-                                for _, copied, encoded, _ in cuda_batch_events
-                            ),
-                            sum(
-                                encoded.elapsed_time(backward)
-                                for _, _, encoded, backward in cuda_batch_events
-                            ),
-                            sum(start.elapsed_time(end) for start, end in cuda_update_events),
-                            float(len(cuda_batch_events)),
-                            float(len(cuda_update_events)),
-                        ],
-                        dtype=torch.float64,
-                        device=context.device,
-                    )
-                else:
-                    profile_values = torch.zeros(6, dtype=torch.float64, device=context.device)
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    torch.distributed.all_reduce(timing_sum_count)
-                    torch.distributed.all_reduce(
-                        timing_max,
-                        op=torch.distributed.ReduceOp.MAX,
-                    )
-                    torch.distributed.all_reduce(profile_values)
+                data_profile = getattr(loader, "profile_snapshot", None)
+                if callable(data_profile):
+                    profile_metrics.update(data_profile(reset=True))
                 host_metrics = (
                     distributed_host_memory_metrics(context.device)
                     if log_host_memory or min_host_available_gb > 0.0
                     else {}
                 )
-                mean_data_wait_ms = float(
-                    (timing_sum_count[0] / timing_sum_count[1].clamp_min(1)).item() * 1000
-                )
-                max_data_wait_ms = float(timing_max[0].item() * 1000)
-                updates_per_second = throughput_window_updates / max(
-                    float(timing_max[1].item()), 1e-9
-                )
-                ms_per_step = 1000.0 / updates_per_second
-                samples_per_second = updates_per_second * batch_contract.global_batch_size
-                batch_profile_count = max(float(profile_values[4].item()), 1.0)
-                update_profile_count = max(float(profile_values[5].item()), 1.0)
-                h2d_ms = float(profile_values[0].item() / batch_profile_count)
-                stage1_ms = float(profile_values[1].item() / batch_profile_count)
-                dit_ms = float(profile_values[2].item() / batch_profile_count)
-                update_ms = float(profile_values[3].item() / update_profile_count)
+                profile_metrics = {**profile_metrics, **host_metrics}
+                update_profile_average(profile_metrics)
+                write_profile_report()
                 min_available_gb = host_metrics.get("memory/host_available_min_gb")
                 memory_guard_triggered = (
                     min_host_available_gb > 0.0
                     and min_available_gb is not None
                     and min_available_gb < min_host_available_gb
                 )
-                data_wait_seconds = 0.0
-                data_wait_max_seconds = 0.0
-                data_wait_batches = 0
-                reset_throughput_window = True
+                reset_profile_window = True
             else:
-                reduced_loss = None
-                reduced_loss_full = None
-                reduced_loss_base = None
-                mean_data_wait_ms = None
-                max_data_wait_ms = None
-                updates_per_second = None
-                ms_per_step = None
-                samples_per_second = None
-                h2d_ms = None
-                stage1_ms = None
-                dit_ms = None
-                update_ms = None
+                profile_metrics = {}
                 host_metrics = {}
                 min_available_gb = None
                 memory_guard_triggered = False
-                reset_throughput_window = False
+                reset_profile_window = False
             if context.is_main and reduced_loss is not None:
                 print(
                     _training_progress_line(
@@ -1044,49 +1213,43 @@ def train_class_conditional(
                         loss=float(reduced_loss.item()),
                         loss_full=float(reduced_loss_full.item()),
                         loss_base=float(reduced_loss_base.item()),
-                        ms_per_step=ms_per_step,
+                        ms_per_step=train_ms_per_step,
                     ),
                     flush=True,
                 )
-                logger.log(
-                    {
-                        "train/loss": float(reduced_loss.item()),
-                        "train/loss_total": float(reduced_loss.item()),
-                        "train/loss_full": float(reduced_loss_full.item()),
-                        "train/loss_base": float(reduced_loss_base.item()),
-                        "train/epoch": epoch,
-                        "train/lr": optimizer.param_groups[0]["lr"],
-                        "train/learning_rate": optimizer.param_groups[0]["lr"],
-                        "train/step_time_sec": 1.0 / updates_per_second,
-                        "train/steps_per_sec": updates_per_second,
-                        "train/samples_per_sec": samples_per_second,
-                        "train/global_batch_size": batch_contract.global_batch_size,
-                        "train/data_wait_ms_mean": mean_data_wait_ms,
-                        "train/data_wait_ms_max": max_data_wait_ms,
-                        "train/updates_per_second": updates_per_second,
-                        "train/samples_per_second": samples_per_second,
-                        "train/h2d_ms": h2d_ms,
-                        "train/stage1_ms": stage1_ms,
-                        "train/dit_ms": dit_ms,
-                        "train/update_ms": update_ms,
-                        **host_metrics,
-                        **(
-                            {
-                                "memory/allocated_gb": torch.cuda.memory_allocated(context.device)
-                                / (1024**3),
-                                "memory/reserved_gb": torch.cuda.memory_reserved(context.device)
-                                / (1024**3),
-                                "memory/max_allocated_gb": torch.cuda.max_memory_allocated(
-                                    context.device
-                                )
-                                / (1024**3),
-                            }
-                            if context.device.type == "cuda"
-                            else {}
-                        ),
-                    },
-                    step=step,
-                )
+                if profile_due:
+                    print(
+                        "[profile] "
+                        f"window={profile_metrics['profile/window_elapsed_sec']:.2f}s "
+                        f"updates={int(profile_metrics['profile/window_updates'])} "
+                        f"data_wait={profile_metrics['profile/data_wait_ms_mean']:.1f}ms "
+                        f"h2d={profile_metrics['profile/h2d_ms']:.1f}ms "
+                        f"stage1={profile_metrics['profile/stage1_ms']:.1f}ms "
+                        f"dit={profile_metrics['profile/dit_ms']:.1f}ms "
+                        f"update={profile_metrics['profile/update_ms']:.1f}ms "
+                        f"allocated={profile_metrics['profile/allocated_gb']:.1f}GiB "
+                        f"reserved={profile_metrics['profile/reserved_gb']:.1f}GiB "
+                        f"peak={profile_metrics['profile/max_allocated_gb']:.1f}GiB",
+                        flush=True,
+                    )
+                train_metrics = {
+                    "train/loss": float(reduced_loss.item()),
+                    "train/loss_total": float(reduced_loss.item()),
+                    "train/loss_full": float(reduced_loss_full.item()),
+                    "train/loss_base": float(reduced_loss_base.item()),
+                    "train/epoch": epoch,
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                    "train/learning_rate": optimizer.param_groups[0]["lr"],
+                    "train/global_batch_size": batch_contract.global_batch_size,
+                }
+                if train_updates_per_second is not None:
+                    train_metrics.update(
+                        {
+                            "train/step_time_sec": 1.0 / train_updates_per_second,
+                            "train/steps_per_sec": train_updates_per_second,
+                        }
+                    )
+                logger.log(train_metrics, step=step)
             if memory_guard_triggered:
                 accumulation.require_boundary()
                 rng_state = gather_rng_states()
@@ -1130,11 +1293,38 @@ def train_class_conditional(
             sample_interval = int(config["wandb"]["sample_interval"])
             if step % sample_interval == 0:
                 if context.is_main:
+                    sample_started_at = time.perf_counter()
                     sample_count = int(config["wandb"].get("sample_count", 4))
                     sample_ids = [step * sample_count + index for index in range(sample_count)]
-                    sample_labels = torch.arange(sample_count) % int(dit.num_classes)
+                    configured_class_ids = config["sampling"].get("class_ids")
+                    if configured_class_ids:
+                        class_ids = [int(value) for value in configured_class_ids]
+                        sample_labels = torch.tensor(
+                            [class_ids[index % len(class_ids)] for index in range(sample_count)]
+                        )
+                    else:
+                        sample_labels = torch.arange(sample_count) % int(dit.num_classes)
                     was_training = dit.training
                     dit.eval()
+                    sample_image_condition = None
+                    sample_raw_condition = None
+                    if config.get("task") == "ci2v":
+                        raw_batch = video[:, :1]
+                        raw_indices = torch.arange(sample_count) % raw_batch.shape[0]
+                        sample_raw_condition = raw_batch[raw_indices]
+                        sample_image = sample_raw_condition.to(
+                            context.device, non_blocking=True
+                        )
+                        if sample_image.dtype == torch.uint8:
+                            sample_image = sample_image.float().div_(255.0)
+                        sample_image = flatten_multiview_video(sample_image)
+                        sample_image = sample_image.repeat_interleave(4, dim=1)
+                        sample_image = run_stage1(
+                            sample_image,
+                            multiview=multiview,
+                            views=views,
+                        )
+                        sample_image_condition = sample_image
                     with ema.average_parameters(dit), precision.autocast():
                         sampled_video = generate_class_conditional(
                             dit,
@@ -1144,7 +1334,7 @@ def train_class_conditional(
                             sample_ids=sample_ids,
                             labels=sample_labels,
                             base_seed=int(config["sampling"]["base_seed"]),
-                            num_chunks=dit.num_chunks,
+                            num_chunks=(dit.num_chunks - 1 if config.get("task") == "ci2v" else dit.num_chunks),
                             grid_size=tuple(dit.grid_size),
                             channels=dit.in_channels,
                             steps=int(config["sampling"]["steps"]),
@@ -1159,6 +1349,8 @@ def train_class_conditional(
                                 config["sampling"].get("internal_guidance_t_max", 1.0)
                             ),
                             device=context.device,
+                            image_condition=sample_image_condition,
+                            raw_condition_frame=sample_raw_condition,
                         )
                     dit.train(was_training)
                     save_sample_tensors(
@@ -1167,7 +1359,7 @@ def train_class_conditional(
                     )
                     logger.log_video(
                         "samples",
-                        sampled_video,
+                        video_to_uint8(sampled_video),
                         step=step,
                         fps=int(config["data"].get("fps", 8)),
                         caption=(
@@ -1181,8 +1373,13 @@ def train_class_conditional(
                         stage1.decoder_execution_metadata(),
                         training_dtype=precision.name,
                     )
+                    print(
+                        f"[sample] step={step} elapsed={time.perf_counter() - sample_started_at:.2f}s",
+                        flush=True,
+                    )
                 barrier()
             if step % checkpoint_interval == 0:
+                checkpoint_started_at = time.perf_counter()
                 rng_state = gather_rng_states()
                 if context.is_main:
                     payload = build_training_checkpoint(
@@ -1208,22 +1405,43 @@ def train_class_conditional(
                     )
                     del payload
                 last_saved_step = step
+                if context.is_main:
+                    print(
+                        f"[checkpoint] step={step} elapsed={time.perf_counter() - checkpoint_started_at:.2f}s",
+                        flush=True,
+                    )
             if max_steps is not None and step >= max_steps:
                 stop = True
                 break
-            if reset_throughput_window:
-                throughput_window_started_at = time.perf_counter()
-                throughput_window_updates = 0
-                cuda_batch_events.clear()
-                cuda_update_events.clear()
+            if step == profile_warmup_steps:
+                profile_window_started_at = time.perf_counter()
+                profile_window_updates = 0
+                profiler.reset()
+                if callable(reset_data_profile):
+                    reset_data_profile(reset=True)
+            elif reset_profile_window:
+                profile_window_started_at = time.perf_counter()
+                profile_window_updates = 0
+                profiler.reset()
+                if callable(reset_data_profile):
+                    reset_data_profile(reset=True)
+            if loss_log_due:
+                train_window_started_at = time.perf_counter()
+                train_window_updates = 0
             batch_requested_at = time.perf_counter()
         if stop:
             break
         release_epoch_memory = getattr(loader, "release_epoch_memory", None)
         if callable(release_epoch_memory):
             release_epoch_memory()
+        if context.is_main:
+            print(
+                f"[epoch-end] epoch={epoch} elapsed={time.perf_counter() - epoch_started_at:.2f}s step={step}",
+                flush=True,
+            )
     if step > 0 and step != last_saved_step:
         accumulation.require_boundary()
+        checkpoint_started_at = time.perf_counter()
         rng_state = gather_rng_states()
         if context.is_main:
             payload = build_training_checkpoint(
@@ -1248,10 +1466,21 @@ def train_class_conditional(
                 drop_page_cache=checkpoint_drop_page_cache,
             )
             del payload
+        if context.is_main:
+            print(
+                f"[checkpoint] step={step} elapsed={time.perf_counter() - checkpoint_started_at:.2f}s",
+                flush=True,
+            )
     close_loader = getattr(loader, "close", None)
     if callable(close_loader):
         close_loader()
+    profiler.stop()
     logger.finish()
+    if context.is_main:
+        print(
+            f"[training-end] step={step} elapsed={time.perf_counter() - training_started_at:.2f}s",
+            flush=True,
+        )
     if memory_guard_message is not None:
         raise RuntimeError(memory_guard_message)
 
@@ -1273,45 +1502,102 @@ def generate_class_conditional(
     cfg_scale: float,
     internal_guidance_scale: float,
     device: torch.device,
-    seed_protocol: str = "splitmix64",
     internal_guidance_t_min: float = 0.0,
     internal_guidance_t_max: float = 1.0,
+    image_condition: torch.Tensor | None = None,
+    raw_condition_frame: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    from vrae.evaluation.common.population import sample_seed, ucf101_sample_seed
-
-    if seed_protocol == "splitmix64":
-        seed_function = sample_seed
-    elif seed_protocol == "ucf101-gfvd-global-sample-v1":
-        seed_function = ucf101_sample_seed
-    else:
-        raise ValueError(f"unknown class-conditional seed protocol: {seed_protocol}")
+    def sample_seed(sample_id: int) -> int:
+        value = ((int(base_seed) << 32) ^ int(sample_id)) & 0xFFFFFFFFFFFFFFFF
+        value = (value + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+        value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+        value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+        return (value ^ (value >> 31)) & 0x7FFFFFFFFFFFFFFF
 
     samples = []
+    multiview = bool(getattr(dit, "multiview_enabled", False))
+    num_views = int(getattr(dit, "num_views", 1))
+    sample_shape = (
+        (num_chunks, num_views, grid_size[0] * grid_size[1], channels)
+        if multiview
+        else (num_chunks, grid_size[0] * grid_size[1], channels)
+    )
     for sample_id in sample_ids:
-        generator = torch.Generator(device=device).manual_seed(seed_function(base_seed, sample_id))
+        generator = torch.Generator(device=device).manual_seed(sample_seed(sample_id))
         samples.append(
             torch.randn(
-                num_chunks,
-                grid_size[0] * grid_size[1],
-                channels,
+                sample_shape,
                 generator=generator,
                 device=device,
             )
         )
     noise = torch.stack(samples)
     labels = labels.to(device)
+    stream_ids = (
+        torch.arange(num_views, device=device).expand(labels.shape[0], num_views)
+        if multiview
+        else None
+    )
     conditional_mask = torch.zeros(labels.shape[0], dtype=torch.bool, device=device)
     unconditional_mask = torch.ones_like(conditional_mask)
+    stream_kwargs = {"stream_ids": stream_ids} if stream_ids is not None else {}
+    model_kwargs = {
+        "labels": labels,
+        "condition_drop_mask": conditional_mask,
+        **stream_kwargs,
+    }
+    unconditional_kwargs = {
+        "labels": labels,
+        "condition_drop_mask": unconditional_mask,
+        **stream_kwargs,
+    }
     normalized = transport.euler_sample(
         dit,
         noise,
-        model_kwargs={"labels": labels, "condition_drop_mask": conditional_mask},
-        unconditional_kwargs={"labels": labels, "condition_drop_mask": unconditional_mask},
+        model_kwargs=model_kwargs,
+        unconditional_kwargs=unconditional_kwargs,
         num_steps=steps,
         cfg_scale=cfg_scale,
         ig_scale=internal_guidance_scale,
         ig_intervals=((internal_guidance_t_min, internal_guidance_t_max),),
+        clean_condition=(
+            image_condition.to(device=device) if image_condition is not None else None
+        ),
     )
+    if multiview:
+        # DiT keeps views explicit: [B,T,V,N,C]. The single-view V-RAE
+        # adapter expects [B*V,T,N,C], so fold views before token-to-grid.
+        batch, time, views, tokens, channels = normalized.shape
+        flat_tokens = (
+            normalized.permute(0, 2, 1, 3, 4)
+            .reshape(batch * views, time, tokens, channels)
+            .contiguous()
+        )
+        flat_tokens = normalizer.denormalize(flat_tokens)
+        flat_grid = stage1.tokens_to_grid(
+            flat_tokens,
+            height=grid_size[0],
+            width=grid_size[1],
+        )
+        decoded = stage1.decode_grid(flat_grid)
+        decoded = decoded.reshape(
+            batch,
+            views,
+            decoded.shape[1],
+            decoded.shape[2],
+            decoded.shape[3],
+            decoded.shape[4],
+        ).permute(0, 2, 1, 3, 4, 5).contiguous()
+        if raw_condition_frame is not None:
+            decoded = torch.cat((raw_condition_frame.to(decoded), decoded), dim=1)
+        return decoded
     clean_tokens = normalizer.denormalize(normalized)
-    clean_grid = stage1.tokens_to_grid(clean_tokens, height=grid_size[0], width=grid_size[1])
-    return stage1.decode_grid(clean_grid)
+    clean_grid = stage1.tokens_to_grid(
+        clean_tokens,
+        height=grid_size[0],
+        width=grid_size[1],
+    )
+    decoded = stage1.decode_grid(clean_grid)
+    if raw_condition_frame is not None:
+        decoded = torch.cat((raw_condition_frame.to(decoded), decoded), dim=1)
+    return decoded

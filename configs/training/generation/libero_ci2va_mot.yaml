@@ -1,0 +1,116 @@
+include:
+  - ../../data/libero.yaml
+
+task: ci2va
+trainer: fastwam
+run_name: fastwam_libero_ci2va_mot
+
+data:
+  dataset: lerobot
+  repo_id: libero
+  num_frames: 21
+  action_horizon: 20
+  frame_interval: 1
+  output_format: fastwam
+  text_embedding_cache_dir: data/text_embeds_cache/libero
+  context_len: 128
+  camera_keys:
+    - {key: observation.images.image, name: head, stream_id: 0}
+    - {key: observation.images.image2, name: wrist, stream_id: 1}
+
+model:
+  factory: fastwam.runtime:create_fastwam_joint
+  factory_kwargs:
+    model_id: Wan-AI/Wan2.2-TI2V-5B
+    tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+    tokenizer_max_len: 128
+    load_text_encoder: false
+    proprio_dim: 8
+    redirect_common_files: false
+    mot_checkpoint_mixed_attn: false
+    action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+    skip_dit_load_from_pretrain: true
+    video_dit_config:
+      has_image_input: false
+      patch_size: [1, 2, 2]
+      in_dim: 48
+      hidden_dim: 3072
+      ffn_dim: 14336
+      freq_dim: 256
+      text_dim: 4096
+      out_dim: 48
+      num_heads: 24
+      attn_head_dim: 128
+      num_layers: 30
+      eps: 1.0e-6
+      seperated_timestep: true
+      require_clip_embedding: false
+      require_vae_embedding: false
+      fuse_vae_embedding_in_latents: true
+      use_gradient_checkpointing: false
+      video_attention_mask_mode: first_frame_causal
+      action_conditioned: false
+      action_dim: 7
+      action_group_causal_mask_mode: group_diagonal
+    action_dit_config:
+      action_dim: 7
+      hidden_dim: 1024
+      ffn_dim: 4096
+      num_heads: 24
+      attn_head_dim: 128
+      num_layers: 30
+      text_dim: 4096
+      freq_dim: 256
+      eps: 1.0e-6
+      use_gradient_checkpointing: false
+    video_scheduler: {train_shift: 5.0, infer_shift: 5.0, num_train_timesteps: 1000}
+    action_scheduler: {train_shift: 1.0, infer_shift: 1.0, num_train_timesteps: 1000}
+    loss: {lambda_video: 1.0, lambda_action: 1.0}
+
+training:
+  batch_size: 1
+  num_workers: 16
+  prefetch_factor: 4
+  persistent_workers: true
+  epochs: 10
+  max_steps: null
+  resume: ckpts/fastwam/fastwam_libero_ci2va_mot/checkpoints/step-00014000.pt
+  precision: bf16
+  clip_grad: 1.0
+  checkpoint_interval: 5000
+  log_interval: 20
+  profile: true
+  profile_window_steps: 200
+  optimizer:
+    lr: 1.0e-4
+    betas: [0.9, 0.95]
+    weight_decay: 1.0e-2
+
+sampling:
+  enabled: true
+  interval_steps: 5000
+  num_samples: 4
+  seed: 3407
+  num_video_frames: 21
+  action_horizon: 20
+  num_inference_steps: 20
+  fps: 10
+  local_dir: outputs/fastwam_samples/${run_name}
+  save_video: true
+  save_trajectory: true
+  upload_wandb: true
+  action_layout:
+    mode: delta
+    position_indices: [0, 1, 2]
+    orientation_indices: [3, 4, 5]
+    gripper_index: 6
+    state_position_indices: [0, 1, 2]
+
+wandb:
+  project: V-RAE
+  group: fastwam_ci2va
+  tags: [libero, lerobot, ci2va, fastwam, mot]
+  mode: online
+  resume: allow
+  log_interval: 20
+  sample_interval: 5000

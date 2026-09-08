@@ -1,7 +1,0 @@
-include: config.yaml
-
-run:
-  name: k600-tfvd-vjepa2-1-dt3
-
-checkpoints:
-  stage1: ckpts/vrae/vrae_vjepa2.1.pt

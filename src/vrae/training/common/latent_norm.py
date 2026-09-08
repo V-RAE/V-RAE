@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -28,7 +27,7 @@ class LatentNormalizer(nn.Module):
 
     def _view(self, value: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
         if latents.ndim == 5:
-            shape = (1, 1, -1, 1, 1)
+            shape = (1, 1, 1, 1, -1) if latents.shape[-1] == self.mean.numel() else (1, 1, -1, 1, 1)
         elif latents.ndim == 4:
             shape = (1, 1, 1, -1)
         else:
@@ -78,8 +77,13 @@ class DistributedLatentStats:
     def update(self, clean_latents: torch.Tensor) -> None:
         if self._reduced:
             raise RuntimeError("Cannot update statistics after distributed reduction")
-        if clean_latents.ndim == 5:
-            values = clean_latents.permute(0, 1, 3, 4, 2).reshape(-1, self.channels)
+        if clean_latents.ndim == 6:
+            values = clean_latents.permute(0, 1, 2, 4, 5, 3).reshape(-1, self.channels)
+        elif clean_latents.ndim == 5:
+            if clean_latents.shape[-1] == self.channels:
+                values = clean_latents.reshape(-1, self.channels)
+            else:
+                values = clean_latents.permute(0, 1, 3, 4, 2).reshape(-1, self.channels)
         elif clean_latents.ndim == 4:
             values = clean_latents.reshape(-1, self.channels)
         else:
@@ -152,14 +156,7 @@ def normalizer_identity(normalizer: LatentNormalizer) -> dict[str, Any]:
         "stage1_checkpoint",
         "future_relative_frames",
     )
-    digest = hashlib.sha256()
-    for name, value in (("mean", normalizer.mean), ("std", normalizer.std)):
-        canonical = value.detach().to(device="cpu", dtype=torch.float32).contiguous()
-        digest.update(name.encode("ascii"))
-        digest.update(str(tuple(canonical.shape)).encode("ascii"))
-        digest.update(canonical.numpy().tobytes())
     return {
         **{field: normalizer.metadata.get(field) for field in fields},
         "channels": int(normalizer.mean.numel()),
-        "statistics_sha256": digest.hexdigest(),
     }

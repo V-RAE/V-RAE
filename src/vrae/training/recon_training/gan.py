@@ -124,6 +124,9 @@ def _legacy_videomae_to_transformers(
                         else:
                             source_name = "q_bias" if parameter == "query" else "v_bias"
                             value = source_tensor(f"encoder.blocks.{layer}.attn.{source_name}")
+                elif remainder in {"q_bias", "v_bias"}:
+                    source_name = remainder
+                    value = source_tensor(f"encoder.blocks.{layer}.attn.{source_name}")
         if value is None:
             source_key = _legacy_source_key(target_key)
             if source_key is None:

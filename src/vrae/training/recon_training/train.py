@@ -28,6 +28,7 @@ from vrae.training.common.contracts import (
     validate_checkpoint_identity,
 )
 from vrae.training.common.distributed import (
+    barrier,
     configure_ddp_gradient_compression,
     gather_rng_states,
     initialize_distributed,
@@ -59,7 +60,7 @@ class ReconstructionGraph(nn.Module):
     def forward(self, video: torch.Tensor) -> dict[str, torch.Tensor]:
         clean = self.vrae.encode(video)
         train_latents = clean
-        sigma = clean.new_zeros((clean.shape[0], clean.shape[1], 1, 1, 1))
+        sigma = clean.new_zeros((*clean.shape[:2], *((1,) * (clean.ndim - 2))))
         if self.training and bool(self.noise_config.get("enabled", False)):
             train_latents, sigma = add_reconstruction_noise(
                 clean, float(self.noise_config.get("tau", 0.0))
@@ -73,6 +74,12 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
     if "wandb" in config:
         validate_wandb_config(config["wandb"])
     training = config["training"]
+    if str(config.get("task")) != "recon_training":
+        raise ValueError("V-JEPA 2.1 entry requires task=recon_training")
+    if str(config["model"]["encoder"]["name"]) != "vjepa2_1":
+        raise ValueError("This training entry only supports the V-JEPA 2.1 encoder")
+    if str(config["data"].get("dataset")) != "lerobot_reconstruction":
+        raise ValueError("V-JEPA 2.1 reconstruction requires data.dataset=lerobot_reconstruction")
     if str(training["scheduler"]["name"]) != "constant":
         raise ValueError("The formal reconstruction scheduler must be constant")
     if float(training["optimizer"]["lr"]) <= 0:
@@ -85,37 +92,26 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("training.init_weights must be model or ema")
     if init_weights == "ema" and not training.get("init_from") and not training.get("resume"):
         raise ValueError("training.init_weights=ema requires init_from or resume")
-    gan = config["gan"]
+    data = config["data"]
+    if not data.get("manifest"):
+        raise ValueError("Libero reconstruction requires data.manifest")
+    interval_min = int(data.get("frame_interval_min", 1))
+    interval_max = int(data.get("frame_interval_max", 4))
+    if interval_min <= 0 or interval_max < interval_min:
+        raise ValueError("Invalid reconstruction frame interval bounds")
+    gan = config.get("gan")
+    if not isinstance(gan, Mapping) or not bool(gan.get("enabled", False)):
+        raise ValueError("Libero reconstruction requires the VideoMAE GAN")
     generator_start = int(gan["generator_start_epoch"])
     discriminator_start = int(gan["discriminator_start_epoch"])
-    if generator_start != discriminator_start:
-        raise ValueError("Generator and discriminator updates must start in the same epoch")
-    if not 0 <= generator_start < int(training["epochs"]):
-        raise ValueError("The adversarial start epoch must be inside the training schedule")
-    if str(gan.get("input_range")) != "zero_one":
-        raise ValueError("The formal VideoMAE discriminator input range must be zero_one")
-    if tuple(int(value) for value in gan["key_depths"]) != (2, 5, 8, 11):
-        raise ValueError("The formal VideoMAE feature depths must be [2,5,8,11]")
-    if int(gan["head_kernel_size"]) != 9 or str(gan["head_norm_type"]) != "bn":
-        raise ValueError("The formal VideoMAE discriminator uses 9-wide locally normalized heads")
-    if not bool(gan["spectral_norm"]):
-        raise ValueError("The formal VideoMAE discriminator heads require spectral normalization")
-    if float(gan["diff_aug_prob"]) != 1.0 or float(gan["diff_aug_cutout"]) != 0.2:
-        raise ValueError("The formal VideoMAE DiffAug recipe is probability=1.0, cutout=0.2")
-    if str(gan["gen_loss_type"]) != "ns_g_loss":
-        raise ValueError("The formal VideoMAE generator uses ns_g_loss")
-    if str(gan["disc_loss_type"]) != "ns_smooth":
-        raise ValueError("The formal VideoMAE discriminator uses ns_smooth")
-    if not bool(gan["lecam"]) or float(gan["lecam_weight"]) != 0.001:
-        raise ValueError("The formal VideoMAE discriminator uses LeCam weight 0.001")
-    if float(gan["discriminator_weight"]) != 0.3:
-        raise ValueError("The formal VideoMAE discriminator loss weight is 0.3")
+    if generator_start != discriminator_start or generator_start != 30:
+        raise ValueError("VideoMAE generator and discriminator must start at epoch 30")
     return {
         "task": config["task"],
         "encoder": config["model"]["encoder"]["name"],
         "pool_group": config["model"]["pooling"]["group_size"],
         "attention_mode": config["model"]["decoder"]["attention_mode"],
-        "video_backend": config["data"].get("video_backend", "auto"),
+        "dataset": "lerobot_reconstruction",
         "ddp_gradient_compression": gradient_compression,
     }
 
@@ -202,17 +198,27 @@ def train(
     batch_preparer: Callable[[Mapping[str, Any], torch.device, Mapping[str, Any]], torch.Tensor]
     | None = None,
 ) -> None:
+    # 阶段 1/3：初始化分布式环境、随机种子和计算设备
     context = initialize_distributed()
+    # context 至少包含：
+    #   rank        当前进程编号
+    #   world_size  进程总数
+    #   local_rank  当前进程在本机上的编号
+    #   device      例如 cuda:0 或 cpu
+    #   is_main     是否为主进程
     seed_everything(int(config["data"].get("seed", 3407)), rank=context.rank)
     if context.device.type == "cuda":
         torch.backends.cudnn.benchmark = bool(config["training"].get("cudnn_benchmark", False))
+     # 阶段 2/3：创建 VRAE 模型并移动到当前设备
     model = VRAE.from_config(config, project_paths=paths).to(context.device)
+    # 可选：编译 encoder
     if bool(config["training"].get("compile_encoder", False)):
         model.encoder.enable_compile(
             mode=str(config["training"].get("compile_encoder_mode", "default")),
             fullgraph=bool(config["training"].get("compile_encoder_fullgraph", False)),
             dynamic=False,
         )
+    # 可选：编译 decoder
     if bool(config["training"].get("compile_decoder", False)):
         compile_dtype = {
             "bf16": torch.bfloat16,
@@ -234,7 +240,9 @@ def train(
     weight_fields = tuple(
         field for field in STAGE1_WEIGHT_COMPATIBILITY_FIELDS if field in model_metadata
     )
+    # 只把模型中允许训练的模块注册进 ModuleDict
     trainable = nn.ModuleDict(model.trainable_groups())
+    # 可能执行预训练权重加载、模块初始化或冻结参数等操作
     initialization = _initialize_model(
         config,
         paths,
@@ -246,10 +254,11 @@ def train(
     graph: nn.Module = ReconstructionGraph(model, config["training"]["latent_noise"]).to(
         context.device
     )
+    # 多卡训练：DDP 包装的是 graph
     if context.world_size > 1:
         graph = DistributedDataParallel(
             graph,
-            device_ids=[context.local_rank] if context.device.type == "cuda" else None,
+            device_ids=[context.local_rank] if context.device.type == "cuda" else None, 
             broadcast_buffers=False,
             find_unused_parameters=False,
             bucket_cap_mb=config["training"].get("ddp_bucket_cap_mb"),
@@ -264,13 +273,17 @@ def train(
         graph,
         config["training"].get("ddp_gradient_compression", "none"),
     )
+    # 优化器和学习率调度器只接收 trainable 中的参数
     optimizer = build_optimizer(trainable.parameters(), config["training"]["optimizer"])
     scheduler = build_scheduler(optimizer, config["training"]["scheduler"])
+    # EMA 保存一份参数的指数移动平均版本，用于更稳定的采样和评估
     ema = ExponentialMovingAverage(trainable, decay=float(config["training"]["ema"]["decay"]))
+    # 根据配置创建混合精度策略
     precision = PrecisionPolicy(
         str(config["training"].get("precision", "bf16")), context.device.type
     )
     scaler = precision.make_scaler()
+
     loss_module = ReconstructionLoss(_resolve_loss_config(config, paths)).to(context.device)
     if bool(config["training"].get("compile_reconstruction_loss", False)):
         loss_module.enable_compile(
@@ -278,14 +291,29 @@ def train(
             fullgraph=bool(config["training"].get("compile_reconstruction_loss_fullgraph", False)),
             dynamic=False,
         )
+    # 数据加载、类别校验与断点恢复
+    # 阶段 1/3：构建 DataLoader 和分布式 sampler
     loader, sampler = loader_builder(
         config, paths, rank=context.rank, world_size=context.world_size
     )
+    class_map_path = run / "class_map.json"
+    if context.is_main and not class_map_path.is_file():
+        loader.dataset.save_class_map(class_map_path)
+    # 等待主进程写完文件，所有进程再读取
+    barrier()
+    class_map = loader.dataset.load_class_map(class_map_path)
+    map_num_classes = int(class_map.get("num_classes", len(class_map["class_names"])))
+    if map_num_classes != len(class_map["class_names"]):
+        raise ValueError("class_map.json has an inconsistent num_classes field")
+    if map_num_classes != loader.dataset.num_classes:
+        raise ValueError("class_map.json does not match the dataset metadata")
     prepare_batch = batch_preparer or (
         lambda batch, device, _config: batch["video"].to(device, non_blocking=True)
     )
     gan_config = dict(config["gan"])
-    gan_checkpoint = paths.checkpoint(gan_config["discriminator_checkpoint"], require_exists=False)
+    gan_checkpoint = paths.checkpoint(
+        gan_config["discriminator_checkpoint"], require_exists=False
+    )
 
     def build_discriminator() -> nn.Module:
         if str(gan_config.get("input_range")) != "zero_one":
@@ -307,13 +335,7 @@ def train(
                 discriminator,
                 device_ids=[context.local_rank] if context.device.type == "cuda" else None,
                 broadcast_buffers=False,
-                bucket_cap_mb=config["training"].get("ddp_bucket_cap_mb"),
-                bucket_cap_mb_list=config["training"].get("ddp_bucket_cap_mb_list"),
-                gradient_as_bucket_view=bool(
-                    config["training"].get("ddp_gradient_as_bucket_view", False)
-                ),
-                static_graph=bool(config["training"].get("ddp_static_graph", False)),
-                batched_grad_copy=bool(config["training"].get("ddp_batched_grad_copy", False)),
+                find_unused_parameters=False,
             )
             configure_ddp_gradient_compression(
                 discriminator,
@@ -321,11 +343,9 @@ def train(
             )
         return discriminator
 
-    gan = GANController(
-        gan_config,
-        build_discriminator,
-        device=context.device,
-    )
+    gan = GANController(gan_config, build_discriminator, device=context.device)
+    # # 梯度累积，例如 accumulation_steps=4：
+    # 4 个 micro-batch 才执行一次 optimizer.step() 
     accumulation = GradientAccumulator(
         int(config["training"].get("gradient_accumulation_steps", 1))
     )
@@ -366,7 +386,7 @@ def train(
         run_id=wandb_run_id,
         exact_resume=bool(config["training"].get("resume")),
     )
-
+    # 阶段 2/3：初始化训练位置
     start_epoch = 0
     step = 0
     resume_path = config["training"].get("resume")
@@ -409,6 +429,7 @@ def train(
         if gan.optimizer is not None:
             optimizer_objects["discriminator"] = gan.optimizer
             scheduler_objects["discriminator"] = gan.scheduler
+        # 恢复模型、EMA、优化器、scheduler、scaler、sampler 等状态
         payload = resume_training(
             resume_checkpoint,
             model=model,
@@ -430,10 +451,11 @@ def train(
     if max_steps is not None and step >= int(max_steps):
         logger.finish()
         return
-
+    # 阈值配置
     checkpoint_interval = int(config["training"].get("checkpoint_interval", 1000))
     log_interval = int(config["wandb"]["log_interval"])
     sample_interval = int(config["wandb"]["sample_interval"])
+    # 固定一批样本，用于不同训练阶段的重建结果对比
     fixed_input_path = run / "samples" / "fixed_input.pt"
     fixed_video: torch.Tensor | None = None
     if context.is_main and fixed_input_path.is_file():
@@ -447,6 +469,7 @@ def train(
     for epoch in range(start_epoch, int(config["training"]["epochs"])):
         loader.dataset.set_epoch(epoch)
         batches = iter(loader)
+        # 仅在默认 batch 预处理、CUDA 和显式开启时启用预取
         if (
             batch_preparer is None
             and context.device.type == "cuda"
@@ -454,9 +477,13 @@ def train(
         ):
             batches = CudaVideoPrefetchIterator(batches, context.device)
         for batch in batches:
+            # 一个梯度累积周期的第一个 micro-step 才清空梯度
             if accumulation.is_first_microstep:
                 optimizer.zero_grad(set_to_none=True)
+            # 输入处理：
+            # 默认是 batch["video"] -> 当前 device
             video = prepare_batch(batch, context.device, config)
+            # 第一次拿到真实 batch 时，保存固定输入样本
             if context.is_main and fixed_video is None:
                 sample_count = min(int(config["wandb"].get("sample_count", 4)), video.shape[0])
                 fixed_video = video[:sample_count].detach().cpu()
@@ -471,15 +498,23 @@ def train(
                 )
             ):
                 torch.compiler.cudagraph_mark_step_begin()
+            # 阶段 2/3：前向、损失和反向传播
             with accumulation.sync_context(graph):
+                # 非最终 micro-step 可能使用 DDP no_sync，
+                # 避免每个 micro-step 都进行梯度通信
                 with precision.autocast():
                     result = graph(video)
+                    # result 至少包含 result["recon"]
                     total, metrics = loss_module(result["recon"], video)
                     adversarial = (
-                        gan.generator_loss(result["recon"], epoch) if gan.active(epoch) else None
+                        gan.generator_loss(result["recon"], epoch)
+                        if gan.active(epoch)
+                        else None
                     )
                     if adversarial is not None:
-                        total = total + float(gan_config.get("generator_weight", 0.0)) * adversarial
+                        total = total + float(gan_config["generator_weight"]) * adversarial
+                    # total：用于反向传播的标量总损失
+                    # metrics：各项损失或监控指标的字典
                 accumulation.backward(total, scaler)
             if gan.active(epoch):
                 with precision.autocast():
@@ -492,13 +527,16 @@ def train(
                         accumulation_steps=accumulation.steps,
                     )
             sampler.commit_batch()
+            # 尚未积累够梯度时，继续读取下一个 micro-batch
             if not accumulation.advance():
                 continue
             if not optimizer_step(optimizer, scaler=scaler):
                 continue
             scheduler.step()
             ema.update(trainable)
+            # step 是 optimizer update 次数，不是 micro-batch 数
             step += 1
+            # 第一次成功更新后记录 decoder 执行信息
             if context.is_main and not execution_metadata_recorded:
                 update_decoder_execution_metadata(
                     run,
@@ -506,6 +544,7 @@ def train(
                     training_dtype=precision.name,
                 )
                 execution_metadata_recorded = True
+            # 阶段 3/3：定期聚合和记录指标
             if step % log_interval == 0:
                 metric_tensors = {**metrics, "total": total.detach()}
                 if adversarial is not None:
@@ -602,7 +641,9 @@ def train(
                         rng_state=rng_state,
                     )
                     payload["gan"] = (
-                        gan.discriminator.state_dict() if gan.discriminator is not None else None
+                        gan.discriminator.state_dict()
+                        if gan.discriminator is not None
+                        else None
                     )
                     payload["gan_runtime"] = {
                         "initialized": gan.discriminator is not None,

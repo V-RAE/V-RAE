@@ -8,6 +8,6 @@ dit:
   mlp_ratio: 4.0
   time_embed_dim: 256
   class_dropout: 0.1
-  num_classes: 101
+  num_classes: 40
   rope_theta: 10000.0
   gradient_checkpointing: true

@@ -1,505 +1,181 @@
-<div align="center">
-<h1>V-RAE: Rethinking Video Latent Spaces for Generation</h1>
-<p>
-  <a href="https://guominghui07.github.io/">Minghui Guo</a><sup>1</sup> &nbsp;&nbsp; <a href="https://sqwu.top/">Shengqiong Wu</a><sup>2</sup> &nbsp;&nbsp; <a href="https://haofei.vip/">Hao Fei</a><sup>2</sup>
-</p>
-<p>
-  <sup>1</sup>National University of Singapore &nbsp;&nbsp; <sup>2</sup>University of Oxford
-</p>
-</div>
+# V-RAE — V-JEPA 2.1 + LIBERO 训练
 
-<!-- **Official PyTorch Implementation** -->
+本分支提供两阶段训练：先在 LIBERO LeRobot 数据上训练 V-RAE 重建模型，再冻结 V-RAE、以 40 个 `suite/task` 为类别训练 class-conditional VideoDiT。默认同时使用 head 和 wrist 两个同步相机。
 
-<p align="center">
-  <a href="https://arxiv.org/abs/2608.13556"><img src="https://img.shields.io/badge/Paper-arXiv-b31b1b" alt="Paper"></a>
-  <a href="https://v-rae.github.io/"><img src="https://img.shields.io/badge/Homepage-Project%20Page-blue" alt="Homepage"></a>
-  <a href="https://huggingface.co/Guomh0707/V-RAE-Models"><img src="https://img.shields.io/badge/Model-Hugging%20Face-yellow" alt="Model"></a>
-</p>
+## 安装
 
-![V-RAE method](assets/V-RAE.png)
-V-RAE is a video representation autoencoder that builds compact generative latents on top of frozen vision foundation model representations. A lightweight temporal pooling module removes temporal redundancy while preserving semantic structure, and a video decoder reconstructs continuous motion from the compressed features.
-
-
-![V-RAE overview](assets/V-RAE-overall.png)
-We evaluate V-RAE with four representative frozen encoders (e.g., `DINOv3`, `SigLIP2`, `V-JEPA2.1`, and `EUPE`) on video reconstruction, semantic probing, and class-conditional generation:
-- V-RAE achieves **2.13 rFVD** on K600, outperforming all evaluated large-scale pretrained video VAEs
-- V-RAE achieves **117.86** and **19.16** gFVD on UCF101 and K600, respectively, while
-converging up to **6× faster**.
-- **tFVD** increases the high Pearson correlations to 𝑟 = 0.621 on UCF101 and 𝑟 = 0.919 on K600, respectively, comparing to rFVD.
-- Semantic latents yielded from V-RAE form a directly decodable predictive state space.
-
-## Visual Results
-
-The examples below follow the same progression as our evaluation: from faithful video reconstruction, to class-conditional generation, and finally to future prediction in the learned latent space.
-
-### Video Reconstruction
-
-V-RAE preserves fine spatial detail and coherent motion while operating on compact semantic latents.
-
-<p align="center">
-  <a href="assets/video-reconstruction-comparison.gif">
-    <img src="assets/video-reconstruction-comparison.gif" alt="Video reconstruction comparison between ground truth, RAEv2, Wan 2.2 VAE, and V-RAE" width="88%">
-  </a>
-</p>
-
-### Class-Conditional Video Generation
-
-The same latent space supports diverse class-conditional generation on both UCF101 and Kinetics-600.
-
-<p align="center">
-  <a href="assets/class-conditional-video-generation-ucf101.gif">
-    <img src="assets/class-conditional-video-generation-ucf101.gif" alt="Class-conditional video generation on UCF101" width="88%">
-  </a>
-</p>
-
-<p align="center">
-  <a href="assets/class-conditional-video-generation-k600.gif">
-    <img src="assets/class-conditional-video-generation-k600.gif" alt="Class-conditional video generation on Kinetics-600" width="88%">
-  </a>
-</p>
-
-### Future Prediction
-
-Beyond reconstruction and generation, V-RAE provides a directly decodable state space for forecasting future video frames.
-
-<p align="center">
-  <a href="assets/world-model-future-prediction.gif">
-    <img src="assets/world-model-future-prediction.gif" alt="Future video prediction comparison between ground truth, Wan 2.2, and V-RAE" width="88%">
-  </a>
-</p>
-
-## Repository Layout
-
-```text
-V-RAE/
-├── src/vrae/              # Installable models, training code, and evaluation code
-├── configs/
-│   ├── models/            # Shared V-RAE and VideoDiT model definitions
-│   ├── training/          # Reconstruction and generation recipes
-│   └── evaluation/        # UCF101, Kinetics-600, and Cityscapes protocols
-├── scripts/
-│   ├── train/             # Distributed training launchers
-│   └── eval/              # Distributed evaluation launchers
-├── sampling.py            # Reconstruction examples
-└── third_party/           # Required upstream encoder implementations
-```
-
-## Installation
-
-The released training and evaluation recipes are intended for Linux systems with NVIDIA GPUs. Before installation, make sure the machine has a CUDA-compatible driver and FFmpeg available; FFmpeg is required by TorchCodec for video decoding. Python 3.10 or later is required.
+需要 Linux、NVIDIA GPU、Python 3.10+ 和 CUDA。LeRobot 必须安装在当前 Python 环境中；本机源码可直接安装：
 
 ```bash
-git clone https://github.com/V-RAE/V-RAE.git
-cd V-RAE
-
 conda create -n vrae python=3.10 -y
 conda activate vrae
 conda install -c conda-forge ffmpeg -y
-
 pip install uv
 uv pip install -e .
+uv pip install -e /zsh/code/lerobot-main
 ```
 
-This installs the pinned PyTorch, TorchVision, TorchCodec, Transformers, and other runtime dependencies declared in `pyproject.toml`. Verify that PyTorch can access CUDA and that TorchCodec can load its video decoder:
+下载官方 V-JEPA 2.1 ViT-L/16 checkpoint：
 
 ```bash
-python -c "import torch; from torchcodec.decoders import VideoDecoder; import vrae; print(f'V-RAE {vrae.__version__} | PyTorch {torch.__version__} | CUDA {torch.version.cuda} | GPU available: {torch.cuda.is_available()}')"
+mkdir -p ckpts/pretrained/encoders/vjepa2_1
+curl -fL https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitl_dist_vitG_384.pt \
+  -o ckpts/pretrained/encoders/vjepa2_1/model.pt
 ```
 
-## 1. Inference
+重建 loss 使用 VGG/LPIPS 权重，下载方式见 [third_party/README.md](third_party/README.md)。
+VideoMAE GAN discriminator 权重也在该文档中，支持 OpenGVLab 的 ModelScope
+镜像下载；正式训练在 epoch 30 初始化 discriminator 前必须准备该文件。
 
-### 1.1 Download V-RAE Weights
+## 数据与类别
 
-V-RAE and generation model checkpoints are available from [V-RAE-Models](https://huggingface.co/Guomh0707/V-RAE-Models). Download the complete repository into the expected local layout:
-
-```bash
-hf download Guomh0707/V-RAE-Models --local-dir ckpts
-```
-
-### 1.2 Run the Code
-
-Place three video samples at:
+共享数据配置为 `configs/data/libero.yaml`，默认读取：
 
 ```text
-assets/sample1.mp4
-assets/sample2.mp4
-assets/sample3.mp4
+/zsh/cache/data/Lerobot/libero
 ```
 
-Run reconstruction with one of the following variants:
+40 个类别按 metadata 中的 `task_index` 显式映射：
+
+- `0..9`：`libero_10`
+- `10..19`：`libero_goal`
+- `20..29`：`libero_object`
+- `30..39`：`libero_spatial`
+
+数据集启动时会验证 40 个真实 task 是否被覆盖且没有重复。每个样本的 label 是对应 `suite/task` 的连续 class ID。
+
+## Stage 1：LIBERO 重建训练
+
+配置：`configs/training/reconstruction/vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained.yaml`。V-JEPA 2.1 始终冻结，只训练 temporal pool 和 V-RAE decoder。
+
+单机八卡启动：
 
 ```bash
-python sampling.py dino
-python sampling.py siglip
-python sampling.py vjepa
-python sampling.py eupe
+scripts/train/vjepa2_1.sh 1 8 0
 ```
 
-Results are saved to:
+仅检查配置和启动命令：
+
+```bash
+VJEPA_DRY_RUN=1 scripts/train/vjepa2_1.sh 1 1 0
+```
+
+默认 Stage 1 checkpoint 最终位于：
 
 ```text
-outputs/<variant>/sample1-comparison.mp4
-outputs/<variant>/sample2-comparison.mp4
-outputs/<variant>/sample3-comparison.mp4
+ckpts/recon_training/vjepa2_1_libero_reconstruction/checkpoints/latest.pt
 ```
 
-## 2. Data and Encoder Weights Preparation
+### Stage 1 视频重建评估
 
-### 2.1 Data Downloading
-
-Download only the datasets needed for training and evaluation:
-
-| Dataset | Used for |
-| --- | --- |
-| [UCF101](https://huggingface.co/datasets/quchenyuan/UCF101-ZIP/tree/04d4e5ca1dc93606cb58752b0c08331e598743a4) | Reconstruction and UCF101 class-conditional generation |
-| [Kinetics-600](https://opendatalab.com/OpenMMLab/Kinetics600) | Reconstruction and K600 class-conditional generation |
-| [Cityscapes](https://www.cityscapes-dataset.com/downloads/) | Future-frame generation (only `leftImg8bit_sequence_trainvaltest.zip` is required) |
-| [CoVLA](https://huggingface.co/datasets/turing-motors/CoVLA-Dataset) | Reconstruction fine-tuning |
-
-### 2.2 Encoder Weights Downloading
-
-Download only the encoder required by the selected V-RAE variant. DINOv3 and
-EUPE reconstruction training additionally use RAEv2 decoder initialization,
-while all reconstruction variants require VGG16/LPIPS and VideoMAE weights.
-
-See [third-party/README](third_party/README.md) for checkpoint sources, download
-commands, and the expected directory layout.
-
-### 2.3 Set Paths
-
-Create a local path YAML file based on the provided template:
-
-```bash
-cp configs/paths.example.yaml configs/paths.local.yaml
-```
-
-Replace the placeholders with the repository and dataset locations. Relative
-paths are resolved from `project_root`.
-
-```yaml
-project_root: path/to/V-RAE
-datasets:
-  ucf101: path/to/UCF-101
-  k600: path/to/Kinetics600/videos
-  cityscapes: path/to/Cityscapes
-  covla: path/to/CoVLA-Dataset
-third_party:
-  dinov3: third_party/dinov3
-  eupe: third_party/eupe
-  vjepa2_1: third_party/vjepa2
-```
-
-Training launchers load this file automatically when it exists. For direct
-`python -m` or `torchrun -m` commands, pass it explicitly with `--paths`.
-
-## 3. Training
-
-Run the commands below from the repository root. The reconstruction, UCF101, and Kinetics-600 launchers take the number of nodes, GPUs per node, current node rank, and V-RAE variant in that order. The accepted short variant names are `dino`, `siglip`, `vjepa`, and `eupe`.
-
-For multi-node jobs, use the same `MASTER_ADDR` and `MASTER_PORT` on every machine. `MASTER_ADDR` must identify node 0 and be reachable from all participating nodes.
-
-Training manifests are local inputs and are not bundled with the repository.
-Place them under the Git-ignored `data/metadata/` directory using the filenames
-referenced by the selected configuration.
-
-| Task | Dataset | Launcher or Module |
-| --- | --- | --- |
-| Reconstruction training | UCF101 + Kinetics-600 | `scripts/train/reconstruction.sh` |
-| Reconstruction fine-tuning | CoVLA | `scripts/train/covla_reconstruction.sh` |
-| Class-conditional generation training | UCF101 | `scripts/train/ucf101.sh` |
-| Class-conditional generation training | Kinetics-600 | `scripts/train/k600.sh` |
-| Future-frame generation training | Cityscapes | `vrae.training.cityscapes_video_pred.train` |
-
-### 3.1 Reconstruction Training
-
-Reconstruction training freezes the visual encoder and optimizes the V-RAE temporal pooler and video decoder. The launcher selects the matching recipe from `configs/training/recon_training/`.
-
-Command template:
-
-```text
-scripts/train/reconstruction.sh <num_nodes> <gpus_per_node> <node_rank> <variant>
-```
-
-Single-node, 8-GPU commands:
-
-```bash
-scripts/train/reconstruction.sh 1 8 0 dino
-scripts/train/reconstruction.sh 1 8 0 siglip
-scripts/train/reconstruction.sh 1 8 0 vjepa
-scripts/train/reconstruction.sh 1 8 0 eupe
-```
-
-Two-node, 16-GPU example using V-JEPA2.1 (run the corresponding command on each node):
-
-```bash
-# Node 0
-MASTER_ADDR=xxxxx MASTER_PORT=29500 \
-  scripts/train/reconstruction.sh 2 8 0 vjepa
-
-# Node 1
-MASTER_ADDR=xxxxx MASTER_PORT=29500 \
-  scripts/train/reconstruction.sh 2 8 1 vjepa
-```
-
-### 3.2 CoVLA Reconstruction Fine-tuning
-
-The CoVLA recipe fine-tunes the EUPE V-RAE at 432x768 with 24-frame clips. The
-example below uses four nodes with eight GPUs per node. Set the same rendezvous
-address and port on all nodes, and give each node a unique rank.
-
-Command template:
-
-```text
-COVLA_NNODES=<num_nodes> COVLA_NPROC_PER_NODE=<gpus_per_node> \
-  NODE_RANK=<node_rank> MASTER_ADDR=<rank0_host> MASTER_PORT=<port> \
-  scripts/train/covla_reconstruction.sh
-```
-
-Four-node, 32-GPU example for node 0; use node ranks 1, 2, and 3 on the other machines:
-
-```bash
-COVLA_NNODES=4 COVLA_NPROC_PER_NODE=8 \
-  NODE_RANK=0 MASTER_ADDR=xxxxx MASTER_PORT=29500 \
-  scripts/train/covla_reconstruction.sh
-```
-
-### 3.3 UCF101 Generation Training
-
-This task freezes the selected V-RAE and trains a class-conditional VideoDiT on UCF101. The launcher selects the matching recipe from `configs/training/ucf_videogen/`.
-
-Command template:
-
-```text
-scripts/train/ucf101.sh <num_nodes> <gpus_per_node> <node_rank> <variant>
-```
-
-Single-node, 8-GPU commands:
-
-```bash
-scripts/train/ucf101.sh 1 8 0 dino
-scripts/train/ucf101.sh 1 8 0 siglip
-scripts/train/ucf101.sh 1 8 0 vjepa
-scripts/train/ucf101.sh 1 8 0 eupe
-```
-
-### 3.4 Kinetics-600 Generation Training
-
-This task freezes the selected V-RAE and trains a class-conditional VideoDiT on Kinetics-600. The launcher selects the matching recipe from `configs/training/k600_videogen/`.
-
-Command template:
-
-```text
-scripts/train/k600.sh <num_nodes> <gpus_per_node> <node_rank> <variant>
-```
-
-Single-node, 8-GPU commands:
-
-```bash
-scripts/train/k600.sh 1 8 0 dino
-scripts/train/k600.sh 1 8 0 siglip
-scripts/train/k600.sh 1 8 0 vjepa
-scripts/train/k600.sh 1 8 0 eupe
-```
-
-Two-node, 16-GPU example using V-JEPA2.1 (run the corresponding command on each node):
-
-```bash
-# Node 0
-MASTER_ADDR=xxxxx MASTER_PORT=29500 \
-  scripts/train/k600.sh 2 8 0 vjepa
-
-# Node 1
-MASTER_ADDR=xxxxx MASTER_PORT=29500 \
-  scripts/train/k600.sh 2 8 1 vjepa
-```
-
-### 3.5 Cityscapes Generation Training
-
-This task trains the future-frame VideoDiT to predict subsequent video frames from context frames. Because it uses the Python distributed entry point directly, pass the local training path file with `--paths`.
-
-Command template:
-
-```text
-torchrun --standalone --nproc_per_node=<num_gpus> \
-  -m vrae.training.cityscapes_video_pred.train \
-  --config <config_file> \
-  --paths <paths_file>
-```
-
-Single-node, 8-GPU command:
-
-```bash
-torchrun --standalone --nproc_per_node=8 \
-  -m vrae.training.cityscapes_video_pred.train \
-  --config configs/training/cityscapes_video_pred/cityscapes.yaml \
-  --paths configs/paths.local.yaml
-```
-
-## 4. Evaluation
-
-Evaluation launchers take the number of local GPUs, V-RAE variant, and global batch size in that order. The global batch size must be divisible by the GPU count. rFVD measures reconstruction quality, gFVD measures generation quality, and tFVD compares the 16-frame interpolated reconstruction against the aligned ground-truth input frames `[4:20]`.
-
-Before launching a protocol, set `inputs.data_root` in its shared
-`configs/evaluation/<task>/config.yaml`. Evaluation launchers do not use the
-training-only `configs/paths.local.yaml`. Evaluation population manifests are
-also local; set `inputs.population` and, when required,
-`inputs.population_metadata` in the same configuration.
-
-### 4.1 Download I3D, Inception, and LPIPS
-
-Download and verify all evaluation weights from the repository root:
+先下载评估模型（I3D、Inception 和 LPIPS/VGG 权重）：
 
 ```bash
 scripts/download_eval_weights.sh
 ```
 
-The script supports resumed downloads and verifies every file after download.
-I3D and Inception are stored under `ckpts/eval_models/`; the VGG16 and LPIPS
-weights are shared with reconstruction training under
-`ckpts/pretrained/perceptual/`.
+对 LIBERO LeRobot 重建 checkpoint 计算 rFVD、LPIPS、PSNR 和 SSIM：
 
-### 4.2 UCF101 rFVD
+```bash
+scripts/eval/libero_rfvd.sh --max-samples 8 --output outputs/libero_rfvd/eval.json
+```
 
-Command template:
+`--max-samples` 可用于快速 smoke 评估；省略时会评估配置中数据集的全部样本。默认使用
+`ckpts/recon_training/vjepa2_1_libero_reconstruction_single_gpu_bs4_50k_detached/checkpoints/step-00050000.pt`
+的 EMA 权重，也可通过 `--checkpoint` 指定其他 Stage 1 checkpoint。
+
+## Stage 2：LIBERO VideoDiT 生成训练
+
+配置：`configs/training/generation/libero_videodit.yaml`。它会读取 Stage 1 的 EMA 权重；latent mean/std 不存在时，会先从每个 episode 采样一个 clip，分布式计算通道统计量，然后开始 VideoDiT 训练。
+
+单机八卡启动：
+
+```bash
+scripts/train/libero_videodit.sh 1 8 0
+```
+
+只验证构建配置：
+
+```bash
+scripts/train/libero_videodit.sh 1 1 0 --build-only
+```
+
+多机时，在所有节点使用相同的 `MASTER_ADDR`/`MASTER_PORT`，并分别传入 node rank。
+
+## Tensor 契约
+
+`LeRobotVideoDataset` 从每个 episode 采样同步 clip，默认输出 `[T,2,3,256,256]` 的 float32 `[0,1]` 视频。V-RAE encoder/decoder 保持原始单视角接口；进入 V-RAE 前将 `[B,T,V,C,H,W]` 重排为 `[B*V,T,C,H,W]`。16 帧经过 V-JEPA tubelet=2 和 temporal pool group=2 后，V-RAE 看到 `[B*V,4,1024,16,16]` latent grid；VideoDiT 仍可使用其原有的 `[B,4,2,256,1024]` 多视角 token 和 `stream_ids` 逻辑。
+
+VideoDiT 只更新自身参数；V-JEPA、temporal pool 和 V-RAE decoder 全部冻结。定期采样会从噪声生成双视角 latent，再经冻结的 V-RAE decoder 还原视频。
+
+训练结束后可直接从正式配置对应 run 的 `checkpoints/latest.pt` 采样：
+
+```bash
+python sampling.py
+```
+
+也可以指定其他训练配置、类别和采样步数：
+
+```bash
+python sampling.py \
+  --config configs/training/generation/vjepa2_1_libero_videodit_high_util_fixed.yaml \
+  --checkpoint ckpts/libero_videogen/vjepa2_1_libero_videodit_high_util_fixed/checkpoints/latest.pt \
+  --labels 0,10,20,30 --num-samples 4 --steps 100
+```
+
+默认输出到 checkpoint run 的 `samples/`，包括 `samples.pt`、每个 sample/view 的 MP4 和 `sampling_metadata.json`。当前多视角输出张量为 `[B,T,V,C,H,W]`，每个视角单独写入一个视频。
+
+## FastWAM MoT：LIBERO ci2va
+
+`configs/training/generation/libero_ci2va_mot.yaml` 使用同一个 LeRobot v3 数据集，按
+`1 + 20` 帧构造 image-conditioned video/action joint batch：两路相机横向拼接为
+`[C,T,H,2W]`，动作序列为 20 步，并附带 episode padding mask。Wan2.2 的重量级组件由
+FastWAM 仓库提供，本仓库负责数据适配、配置校验和训练循环。
+
+先在环境中安装 FastWAM，并设置其源码目录，然后只检查配置：
+
+```bash
+FASTWAM_ROOT=/path/to/FastWAM \
+  scripts/train/libero_fastwam.sh 1 1 0 --build-only
+```
+
+正式训练需要 Wan2.2、ActionDiT backbone 和对应 VAE/text 资源；数据路径可通过
+`configs/paths.local.yaml` 的 `datasets.lerobot` 覆盖：
+
+配置默认使用 FastWAM 的 T5 embedding cache（`data/text_embeds_cache/libero`）。先按
+FastWAM 仓库的 `scripts/precompute_text_embeds.py` 生成这些缓存，或将
+`data.text_embedding_cache_dir` 改为已有缓存目录。
+
+```bash
+FASTWAM_ROOT=/path/to/FastWAM \
+  scripts/train/libero_fastwam.sh 1 1 0
+```
+
+生产训练入口固定调用官方 `fastwam.runtime:create_fastwam_joint`。仓库内的
+`vrae.models.dit.fastwam.FastWAM` 只保留为组件注入式实验 adapter，不从
+`vrae.models.dit` 聚合导出，也不用于生产配置。
+
+恢复训练时将 `training.resume` 设置为 step checkpoint 或 `latest.json`。`max_steps`
+始终表示全程目标 step；恢复会加载模型、optimizer 和 step，但从新的 shuffle epoch
+开始，不保证逐 batch 复现。每次保存只生成一个 `step-XXXXXXXX.pt`，同目录的
+`latest.json` 是小型指针文件。默认每 20 step 输出 data wait、VAE encode、MoT
+forward、backward 和 optimizer 耗时。
+
+默认每 5000 step 由 rank 0 对四个固定样本执行联合采样，宽度拼接的 MP4 和预测/真值
+轨迹 PNG 保存在 `outputs/fastwam_samples/${run_name}`，并上传相同文件到 WandB。
+WandB 凭据只从环境变量或本机登录读取。
+
+## 目录
 
 ```text
-scripts/eval/ucf101_rfvd.sh <num_gpus> <variant> <global_batch_size>
-```
-
-Evaluation commands:
-
-```bash
-scripts/eval/ucf101_rfvd.sh 8 dino 512
-scripts/eval/ucf101_rfvd.sh 8 siglip 512
-scripts/eval/ucf101_rfvd.sh 8 vjepa 512
-scripts/eval/ucf101_rfvd.sh 8 eupe 512
-```
-
-The adjacent-frame V-JEPA2.1 protocol uses its dedicated configuration:
-
-```bash
-torchrun --standalone --nproc_per_node=8 \
-  -m vrae.evaluation.ucf101_rfvd.run \
-  --config configs/evaluation/ucf101_rfvd/config_interval1.yaml
-```
-
-### 4.3 UCF101 gFVD
-
-Command template:
-
-```text
-scripts/eval/ucf101_gfvd.sh <num_gpus> <variant> <global_batch_size>
-```
-
-Evaluation commands:
-
-```bash
-scripts/eval/ucf101_gfvd.sh 8 vjepa 512
-scripts/eval/ucf101_gfvd.sh 8 eupe 512
-```
-
-### 4.4 UCF101 tFVD
-
-Command template:
-
-```text
-scripts/eval/ucf101_tfvd.sh <num_gpus> <variant> <global_batch_size>
-```
-
-Evaluation commands:
-
-```bash
-scripts/eval/ucf101_tfvd.sh 8 dino 512
-scripts/eval/ucf101_tfvd.sh 8 siglip 512
-scripts/eval/ucf101_tfvd.sh 8 vjepa 512
-scripts/eval/ucf101_tfvd.sh 8 eupe 512
-```
-
-### 4.5 Kinetics-600 rFVD
-
-Command template:
-
-```text
-scripts/eval/k600_rfvd.sh <num_gpus> <variant> <global_batch_size>
-```
-
-Evaluation commands:
-
-```bash
-scripts/eval/k600_rfvd.sh 8 dino 1024
-scripts/eval/k600_rfvd.sh 8 siglip 1024
-scripts/eval/k600_rfvd.sh 8 vjepa 1024
-scripts/eval/k600_rfvd.sh 8 eupe 1024
-```
-
-### 4.6 Kinetics-600 gFVD
-
-Command template:
-
-```text
-scripts/eval/k600_gfvd.sh <num_gpus> <variant> <global_batch_size>
-```
-
-Evaluation commands:
-
-```bash
-scripts/eval/k600_gfvd.sh 8 vjepa 512
-```
-
-### 4.7 Kinetics-600 tFVD
-
-Command template:
-
-```text
-scripts/eval/k600_tfvd.sh <num_gpus> <variant> <global_batch_size>
-```
-
-Evaluation commands:
-
-```bash
-scripts/eval/k600_tfvd.sh 8 dino 1024
-scripts/eval/k600_tfvd.sh 8 siglip 1024
-scripts/eval/k600_tfvd.sh 8 vjepa 1024
-scripts/eval/k600_tfvd.sh 8 eupe 1024
-```
-
-### 4.8 Cityscapes rFVD, gFID, and gFVD
-
-The `cityscapes_rfvd` protocol evaluates video reconstruction, while `cityscapes_gfid_gfvd` evaluates future-frame generation. Set `inputs.data_root` and the checkpoint fields in each configuration before launching it.
-
-Command template:
-
-```text
-torchrun --standalone --nproc_per_node=<num_gpus> \
-  -m <evaluation_module> \
-  --config <config_file>
-```
-
-Single-node, 8-GPU commands:
-
-```bash
-torchrun --standalone --nproc_per_node=8 \
-  -m vrae.evaluation.cityscapes_rfvd.run \
-  --config configs/evaluation/cityscapes_rfvd/config.yaml
-
-torchrun --standalone --nproc_per_node=8 \
-  -m vrae.evaluation.cityscapes_gfid_gfvd.run \
-  --config configs/evaluation/cityscapes_gfid_gfvd/config.yaml
-```
-
-## Acknowledgements
-
-The codebase is built upon some amazing projects: [RAE](https://github.com/bytetriper/RAE), [RAEv2](https://github.com/nanovisionx/RAEv2), [DINOv3](https://github.com/facebookresearch/dinov3), [SigLIP2](https://huggingface.co/google/siglip2-large-patch16-256), [V-JEPA 2](https://github.com/facebookresearch/vjepa2), [EUPE](https://github.com/facebookresearch/EUPE), and [EVATok](https://github.com/HKU-MMLab/EVATok). We thank the authors for making their work publicly available.
-
-We also sincerely thank [Saining Xie](https://www.sainingxie.com/) for his direct guidance and valuable feedback, which has greatly helped to shape V-RAE.
-
-## BibTeX
-
-```bibtex
-@article{guo2026vrae,
-  title   = {V-RAE: Rethinking Video Latent Spaces for Generation},
-  author  = {Guo, Minghui and Wu, Shengqiong and Fei, Hao},
-  journal = {arXiv preprint arXiv:2608.13556},
-  year    = {2026},
-}
+src/vrae/models/dit/                    class-conditional VideoDiT 与 flow transport
+src/vrae/data/                          LeRobot episode/clip 数据集
+src/vrae/training/recon_training/       Stage 1 重建训练
+src/vrae/training/libero_videogen/      Stage 2 LIBERO 生成入口
+src/vrae/training/fastwam/              FastWAM MoT ci2va 训练入口
+configs/data/libero.yaml                数据、相机和 40 类映射
+configs/training/reconstruction/       重建训练配置
+configs/training/generation/           VideoDiT 生成训练配置
+configs/training/generation/libero_ci2va_mot.yaml  FastWAM ci2va 配置
+configs/training/common/               重建/生成共用训练基础配置
 ```

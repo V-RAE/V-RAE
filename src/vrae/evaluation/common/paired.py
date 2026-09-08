@@ -68,11 +68,6 @@ class PairedMetricAccumulator:
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
         self.lpips_model = lpips_model
-        from torchmetrics.functional.image.ssim import (
-            structural_similarity_index_measure,
-        )
-
-        self._ssim = structural_similarity_index_measure
         self._totals = torch.zeros(6, dtype=torch.float64, device=self.device)
 
     @torch.inference_mode()
@@ -113,18 +108,13 @@ class PairedMetricAccumulator:
             frame_squared_error = squared_error.flatten(1).sum(dim=1, dtype=torch.float64)
             frame_mse = frame_squared_error / float(pixels_per_frame)
             frame_psnr = -10.0 * torch.log10(frame_mse.clamp_min(self._PSNR_MSE_FLOOR))
-            ssim = self._ssim(
-                preds=prediction,
-                target=target,
-                data_range=1.0,
-                reduction="elementwise_mean",
-            )
+            ssim = ssim_per_frame(target, prediction)
 
             self._totals[self._SQUARED_ERROR].add_(frame_squared_error.sum())
             self._totals[self._PIXELS].add_(float(count * pixels_per_frame))
             self._totals[self._FRAME_PSNR].add_(frame_psnr.sum())
             self._totals[self._FRAMES].add_(float(count))
-            self._totals[self._SSIM].add_(ssim.double() * count)
+            self._totals[self._SSIM].add_(ssim.double().sum())
             if metric is not None:
                 lpips = metric(target * 2.0 - 1.0, prediction * 2.0 - 1.0)
                 self._totals[self._LPIPS].add_(lpips.reshape(count, -1).mean(1).double().sum())

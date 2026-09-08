@@ -117,7 +117,8 @@ class VRAE(nn.Module):
             raise ValueError(f"Unknown decoder initialization mode: {init_mode}")
         elif init_checkpoint is not None:
             raise ValueError("decoder.checkpoint is only valid with decoder.init=raev2_image")
-        return cls(encoder, pool, decoder)
+        instance = cls(encoder, pool, decoder)
+        return instance
 
     def train(self, mode: bool = True) -> VRAE:
         super().train(mode)

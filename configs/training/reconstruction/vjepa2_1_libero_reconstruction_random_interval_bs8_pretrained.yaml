@@ -1,0 +1,30 @@
+include:
+  - ../common/vjepa2_1_lerobot.yaml
+
+run_name: vjepa2_1_libero_reconstruction_random_interval_bs8_pretrained
+data:
+  frame_interval: 4
+  random_frame_interval: true
+  frame_interval_min: 1
+  frame_interval_max: 4
+training:
+  init_from: ckpts/pretrained/vrae/vrae_vjepa2.1.pt
+  init_weights: ema
+  resume: null
+  epochs: 50
+  global_batch_size: 8
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 4
+  persistent_workers: true
+  prefetch_to_device: true
+  checkpoint_interval: 1000
+wandb:
+  mode: online
+  project: V-RAE
+  group: libero_reconstruction
+  tags: [libero, reconstruction, vjepa2_1, single_view, random_interval, pretrained]
+  resume: never
+  log_interval: 20
+  sample_interval: 2000
+  sample_count: 4

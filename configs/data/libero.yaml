@@ -1,0 +1,16 @@
+model:
+  multiview:
+    enabled: true
+    num_views: 2
+data:
+  dataset: lerobot
+  root: /zsh/cache/data/Lerobot/libero
+  repo_id: libero
+  split: train
+  camera_keys:
+    - {key: observation.images.image, name: head, stream_id: 0}
+    - {key: observation.images.image2, name: wrist, stream_id: 1}
+  num_frames: 16
+  image_size: 256
+  fps: 10
+  seed: 3407

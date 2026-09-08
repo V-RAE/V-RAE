@@ -1,0 +1,4 @@
+include:
+  - libero_ci2v_from_multiview_L.yaml
+
+run_name: vjepa2_1_libero_ci2v_from_multiview_l_gc_restart_20260905

@@ -45,6 +45,10 @@ STAGE1_STRUCTURE_FIELDS = (
     "checkpoint_weight_source",
     "runtime_image_size",
     "runtime_grid_size",
+    "multiview_enabled",
+    "num_views",
+    "num_streams",
+    "camera_keys",
 )
 
 # The declared runtime geometry affects latent statistics and exact resume, but
@@ -133,11 +137,6 @@ def canonical_resume_config(config: Mapping[str, Any]) -> dict[str, Any]:
     # sampler, or numerical checkpoint identity. This lets an exact run resume
     # after a safer loader/checkpoint implementation is deployed.
     result.pop("runtime", None)
-    data = result.get("data")
-    if isinstance(data, dict) and data.get("video_backend", "auto") == "auto":
-        # This project only permitted auto->TorchCodec for training; normalize
-        # the historical spelling now that the decoder is explicit.
-        data["video_backend"] = "torchcodec"
     training = result.get("training")
     if isinstance(training, dict):
         training["resume"] = None

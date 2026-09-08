@@ -1,0 +1,7 @@
+include:
+  - libero_ci2va_mot_dual_video_loss.yaml
+
+run_name: fastwam_libero_ci2va_mot_dual_video_loss_formal
+
+wandb:
+  name: fastwam_libero_ci2va_mot_dual_video_loss_formal

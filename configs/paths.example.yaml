@@ -1,10 +1,5 @@
 project_root: path/to/V-RAE
 datasets:
-  ucf101: path/to/UCF-101
-  k600: path/to/Kinetics600/videos
-  cityscapes: path/to/Cityscapes
-  covla: path/to/CoVLA-Dataset
+  lerobot: /zsh/cache/data/Lerobot/libero
 third_party:
-  dinov3: path/to/V-RAE/third_party/dinov3
-  eupe: path/to/V-RAE/third_party/eupe
   vjepa2_1: path/to/V-RAE/third_party/vjepa2

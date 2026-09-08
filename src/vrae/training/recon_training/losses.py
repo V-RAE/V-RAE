@@ -384,6 +384,12 @@ class ReconstructionLoss(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if reconstructed.shape != target.shape:
             raise ValueError("Reconstruction and target shapes differ")
+        if reconstructed.ndim == 6:
+            batch, time, views, channels, height, width = reconstructed.shape
+            reconstructed = reconstructed.permute(0, 2, 1, 3, 4, 5).reshape(batch * views, time, channels, height, width)
+            target = target.permute(0, 2, 1, 3, 4, 5).reshape(batch * views, time, channels, height, width)
+        elif reconstructed.ndim != 5:
+            raise ValueError("Reconstruction inputs must be [B,T,3,H,W] or [B,T,V,3,H,W]")
         zero = reconstructed.new_zeros(())
         l1 = F.l1_loss(reconstructed, target) if self.weights["l1"] else zero
         temporal = (
@@ -413,10 +419,49 @@ class ReconstructionLoss(nn.Module):
         }
 
     def forward(
-        self, reconstructed: torch.Tensor, target: torch.Tensor
+        self,
+        reconstructed: torch.Tensor,          # 重建结果；需与 target 形状兼容
+        target: torch.Tensor,                 # 目标张量
+        stream_ids: torch.Tensor | None = None,  # 可选的 stream 编号
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        return (
+        # 阶段 1/3：选择核心计算路径
+        # 如果存在预编译版本，就使用它；否则调用普通实现。
+        # 两个函数应返回相同结构：
+        #   (一个 Tensor, 一个 dict[str, Tensor])
+        result = (
             self._compiled_forward(reconstructed, target)
             if self._compiled_forward is not None
             else self._forward_impl(reconstructed, target)
         )
+
+        # 阶段 2/3：判断是否需要统计每个 stream 的误差
+        # 只有当：
+        #   1. stream_ids 被传入；
+        #   2. reconstructed 恰好是 6 维；
+        #   3. stream_ids 是 2 维；
+        # 才执行下面的 per-view 统计。
+        if stream_ids is not None and reconstructed.ndim == 6 and stream_ids.ndim == 2:
+
+            # 阶段 3/3：计算每个 view 的平均绝对误差（L1）
+            #
+            # 假设 reconstructed 形状为 [B, T, V, H, W, C]：
+            #   dim=(0, 1, 3, 4, 5) 会平均掉 B、T、H、W、C，
+            #   保留 V，因此 per_view 形状为 [V]。
+            #
+            # .detach() 表示这个统计量不参与反向传播，只作为日志指标。
+            per_view = (
+                (reconstructed - target)
+                .abs()
+                .mean(dim=(0, 1, 3, 4, 5))
+                .detach()
+            )
+
+            # stream_ids[0] 取第一个 batch 样本的 stream 编号。
+            # view 是 view 下标，stream 是对应的实际 stream ID。
+            for view, stream in enumerate(stream_ids[0].tolist()):
+                # 例如 stream=7 时，新增：
+                # result[1]["l1_stream_7"] = per_view[view]
+                result[1][f"l1_stream_{int(stream)}"] = per_view[view]
+
+        # 返回主结果和指标字典
+        return result

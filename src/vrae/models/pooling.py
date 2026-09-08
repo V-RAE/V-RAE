@@ -85,31 +85,122 @@ class TemporalAttentionPool(nn.Module):
             )
 
         output_time = time // self.group_size
-        grouped = x.reshape(batch, output_time, self.group_size, channels, height, width)
-        grouped = grouped.permute(0, 1, 4, 5, 2, 3).reshape(
-            batch * output_time * height * width, self.group_size, channels
+        # Group consecutive temporal tokens:
+        # [B, Te, C, H, W] -> [B, T_out, G, C, H, W]
+        grouped = x.reshape(
+            batch,
+            output_time,
+            self.group_size,
+            channels,
+            height,
+            width,
         )
+        # Flatten batch, output-time, and spatial locations. Each location
+        # contains only the G tokens from one temporal group.
+        grouped = (
+            grouped.permute(
+                0,
+                1,
+                4,
+                5,
+                2,
+                3,
+            )
+            .reshape(
+                batch * output_time * height * width,
+                self.group_size,
+                channels,
+            )
+        )
+
         locations = grouped.shape[0]
-        key = self.key(self.norm_k(grouped)).reshape(
-            locations, self.group_size, self.num_heads, self.head_dim
+
+        # Project keys and values. Only the key input is normalized.
+        key = (
+            self.key(self.norm_k(grouped))
+            .reshape(
+                locations,
+                self.group_size,
+                self.num_heads,
+                self.head_dim,
+            )
         )
-        value = self.value(grouped).reshape(
-            locations, self.group_size, self.num_heads, self.head_dim
+
+        value = (
+            self.value(grouped)
+            .reshape(
+                locations,
+                self.group_size,
+                self.num_heads,
+                self.head_dim,
+            )
         )
+
+        # Use the standard multi-head layout [L, heads, G, head_dim].
         key = key.permute(0, 2, 1, 3)
         value = value.permute(0, 2, 1, 3)
-        query = self.query.expand(locations, -1, -1, -1)
+
+        # Expand the shared query across all locations without copying it.
+        query = self.query.expand(
+            locations,
+            -1,
+            -1,
+            -1,
+        )
+        # Compute one query-to-key score for each token in the group:
+        # [L, heads, 1, head_dim] x [L, heads, G, head_dim]
+        # -> [L, heads, G]
         logits = (query * key).sum(-1) * self.scale
+
+        # Add an optional bias for each relative position within the group.
         if self.time_bias is not None:
-            logits = logits + self.time_bias.to(dtype=logits.dtype, device=logits.device)[None]
+            time_bias = self.time_bias.to(
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+
+            logits = logits + time_bias[None]
+
+        # Normalize attention weights over the temporal group dimension.
         attention = logits.softmax(dim=-1)
-        pooled = (attention.unsqueeze(-1) * value).sum(dim=2).reshape(locations, channels)
+        # Aggregate values and merge the attention heads back into C.
+        pooled = (attention.unsqueeze(-1) * value).sum(dim=2)
+        pooled = pooled.reshape(locations, channels)
+
+        # Apply the output projection and non-affine LayerNorm.
         pooled = self.norm_out(self.proj(pooled))
-        pooled = pooled.reshape(batch, output_time, height, width, channels)
-        pooled = pooled.permute(0, 1, 4, 2, 3).contiguous()
+
+        # Restore the output layout [B, T_out, C, H, W].
+        pooled = pooled.reshape(
+            batch,
+            output_time,
+            height,
+            width,
+            channels,
+        )
+
+        pooled = (
+            pooled.permute(
+                0,
+                1,
+                4,
+                2,
+                3,
+            )
+            .contiguous()
+        )
+
         if not return_attention:
             return pooled
+
+        # Return attention in [B, T_out, H, W, heads, G] layout when requested.
         attention = attention.reshape(
-            batch, output_time, height, width, self.num_heads, self.group_size
+            batch,
+            output_time,
+            height,
+            width,
+            self.num_heads,
+            self.group_size,
         )
+
         return pooled, attention

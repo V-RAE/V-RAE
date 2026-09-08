@@ -1,9 +1,0 @@
-include: config.yaml
-
-run:
-  name: ucf101-gfvd-eupe-dit
-
-checkpoints:
-  stage1: ckpts/vrae/vrae_eupe.pt
-  dit: ckpts/ucf101_dit/ucf101_dit_eupe.pt
-  latent_normalizer: ckpts/ucf101_dit/ucf101_latent_stats_eupe.pt

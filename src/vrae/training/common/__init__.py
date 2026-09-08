@@ -3,8 +3,8 @@ from vrae.training.common.latent_norm import DistributedLatentStats, LatentNorma
 from vrae.training.common.sampler import StatefulDistributedBatchSampler
 
 __all__ = [
-    "DistributedLatentStats",
     "ExponentialMovingAverage",
+    "DistributedLatentStats",
     "LatentNormalizer",
     "StatefulDistributedBatchSampler",
 ]

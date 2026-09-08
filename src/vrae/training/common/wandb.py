@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -167,3 +168,44 @@ class WandbLogger:
             for index, item in enumerate(values)
         }
         self.run.log(media, step=int(step))
+
+    def log_video_files(
+        self,
+        name: str,
+        paths: Sequence[str | Path],
+        *,
+        step: int,
+        caption: str | None = None,
+    ) -> None:
+        """Upload already encoded MP4 files without requiring MoviePy."""
+
+        if self.run is None or self._wandb is None:
+            return
+        prefix = str(name).rstrip("/")
+        media = {
+            f"{prefix}/video_{index:03d}": self._wandb.Video(
+                str(path),
+                format="mp4",
+                caption=caption,
+            )
+            for index, path in enumerate(paths)
+        }
+        if media:
+            self.run.log(media, step=int(step))
+
+    def log_image_files(
+        self,
+        name: str,
+        paths: Sequence[str | Path],
+        *,
+        step: int,
+    ) -> None:
+        if self.run is None or self._wandb is None:
+            return
+        prefix = str(name).rstrip("/")
+        media = {
+            f"{prefix}/image_{index:03d}": self._wandb.Image(str(path))
+            for index, path in enumerate(paths)
+        }
+        if media:
+            self.run.log(media, step=int(step))

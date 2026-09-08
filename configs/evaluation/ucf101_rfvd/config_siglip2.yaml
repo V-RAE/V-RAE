@@ -1,7 +1,0 @@
-include: config.yaml
-
-run:
-  name: ucf101-rfvd-siglip2
-
-checkpoints:
-  stage1: ckpts/vrae/vrae_siglip2.pt

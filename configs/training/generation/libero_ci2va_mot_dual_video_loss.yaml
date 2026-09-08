@@ -1,0 +1,20 @@
+include:
+  - libero_ci2va_mot.yaml
+
+run_name: fastwam_libero_ci2va_mot_dual_video_loss
+
+model:
+  factory_kwargs:
+    video_dit_config:
+      base_model_depth: 8
+    loss:
+      lambda_video: 1.0
+      lambda_action: 1.0
+      base_model_coeff: 1.0
+
+training:
+  resume: null
+  init_from: ckpts/fastwam/fastwam_libero_ci2va_mot/checkpoints/latest.json
+
+wandb:
+  name: fastwam_libero_ci2va_mot_dual_video_loss

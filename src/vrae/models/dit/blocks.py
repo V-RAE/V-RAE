@@ -11,12 +11,7 @@ from vrae.models.decoder import (
     _flash_attention,
     resolve_attention_backend,
 )
-from vrae.models.rope3d import (
-    apply_video_dit_3d_rope_cache,
-    apply_video_dit_3d_rope_to_positions,
-)
-
-VideoDiTRoPECache = tuple[torch.Tensor, torch.Tensor]
+from vrae.models.dit.rope import apply_rope
 
 
 def as_pair(value: int | Sequence[int], name: str) -> tuple[int, int]:
@@ -33,6 +28,31 @@ def as_pair(value: int | Sequence[int], name: str) -> tuple[int, int]:
 
 def modulate(value: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return value * (1 + scale) + shift
+
+
+def _fuse_legacy_linear_state(
+    state_dict: dict[str, torch.Tensor],
+    prefix: str,
+    fused_name: str,
+    legacy_names: tuple[str, ...],
+) -> None:
+    """Combine legacy Linear parameters along the output dimension."""
+    for parameter_name in ("weight", "bias"):
+        fused_key = f"{prefix}{fused_name}.{parameter_name}"
+        legacy_keys = [
+            f"{prefix}{legacy_name}.{parameter_name}"
+            for legacy_name in legacy_names
+        ]
+        if fused_key in state_dict:
+            continue
+        if not all(key in state_dict for key in legacy_keys):
+            continue
+        state_dict[fused_key] = torch.cat(
+            [state_dict[key] for key in legacy_keys],
+            dim=0,
+        )
+        for key in legacy_keys:
+            state_dict.pop(key)
 
 
 class RMSNorm(nn.Module):
@@ -54,12 +74,28 @@ class RMSNorm(nn.Module):
 class SwiGLUFeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int) -> None:
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim)
-        self.w2 = nn.Linear(dim, hidden_dim)
+        self.w12 = nn.Linear(dim, hidden_dim * 2)
         self.w3 = nn.Linear(hidden_dim, dim)
+        self.register_load_state_dict_pre_hook(self._load_legacy_w12)
+
+    @staticmethod
+    def _load_legacy_w12(
+        module: nn.Module,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        *args: object,
+    ) -> None:
+        _fuse_legacy_linear_state(state_dict, prefix, "w12", ("w1", "w2"))
+        _fuse_legacy_linear_state(
+            state_dict,
+            prefix,
+            "w12",
+            ("gate_proj", "up_proj"),
+        )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        return self.w3(F.silu(self.w1(value)) * self.w2(value))
+        first, second = self.w12(value).chunk(2, dim=-1)
+        return self.w3(F.silu(first) * second)
 
 
 # The shorter name matches the public DDT reference.
@@ -89,15 +125,18 @@ class GaussianFourierTimeEmbedding(nn.Module):
         )
 
     def forward(self, time: torch.Tensor) -> torch.Tensor:
+        """Embed sample times, preserving ``[B]`` or ``[B,T]`` leading dims."""
         if time.ndim == 0:
             time = time[None]
-        if time.ndim != 1:
-            raise ValueError(f"time must be scalar or [B], got {tuple(time.shape)}")
-        angles = time.float()[:, None] * self.frequencies.float()[None, :] * (2 * torch.pi)
+        if time.ndim not in (1, 2):
+            raise ValueError(f"time must have shape [B] or [B,T], got {tuple(time.shape)}")
+        input_shape = time.shape
+        flat_time = time.reshape(-1)
+        angles = flat_time.float()[:, None] * self.frequencies.float()[None, :] * (2 * torch.pi)
         features = torch.cat((angles.sin(), angles.cos()), dim=-1)
         parameter = self.mlp[0].weight
         features = features.to(device=parameter.device, dtype=parameter.dtype)
-        return self.mlp(features).unsqueeze(1)
+        return self.mlp(features).reshape(*input_shape, -1)
 
 
 class QKNormAttention(nn.Module):
@@ -126,40 +165,57 @@ class QKNormAttention(nn.Module):
         self.rope_theta = float(rope_theta)
         self.attention_dropout = float(attention_dropout)
         self.attention_backend = attention_backend
-        self.q = nn.Linear(self.dim, self.dim)
-        self.k = nn.Linear(self.dim, self.dim)
-        self.v = nn.Linear(self.dim, self.dim)
+        self.qkv = nn.Linear(self.dim, self.dim * 3)
         self.proj = nn.Linear(self.dim, self.dim)
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
+        self.register_load_state_dict_pre_hook(self._load_legacy_qkv)
+
+    @staticmethod
+    def _load_legacy_qkv(
+        module: nn.Module,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        *args: object,
+    ) -> None:
+        _fuse_legacy_linear_state(state_dict, prefix, "qkv", ("q", "k", "v"))
+        _fuse_legacy_linear_state(
+            state_dict,
+            prefix,
+            "qkv",
+            ("q_proj", "k_proj", "v_proj"),
+        )
 
     def forward(
         self,
         value: torch.Tensor,
-        positions: torch.Tensor,
+        freqs: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        *,
-        rope_cache: VideoDiTRoPECache | None = None,
     ) -> torch.Tensor:
         if value.ndim != 3:
             raise ValueError(f"attention input must be [B,L,D], got {tuple(value.shape)}")
         batch, length, _ = value.shape
-        if positions.shape != (length, 3):
+        if freqs.shape[0] != length:
             raise ValueError(
-                f"positions must have shape [{length},3], got {tuple(positions.shape)}"
+                f"freqs must have shape [{length},1,R], got {tuple(freqs.shape)}"
             )
-        q = self.q(value).reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k(value).reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v(value).reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
+        qkv = self.qkv(value).reshape(
+            batch,
+            length,
+            3,
+            self.num_heads,
+            self.head_dim,
+        )
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        if rope_cache is None:
-            q = apply_video_dit_3d_rope_to_positions(q, positions, theta=self.rope_theta)
-            k = apply_video_dit_3d_rope_to_positions(k, positions, theta=self.rope_theta)
-        else:
-            cosine, sine = rope_cache
-            q = apply_video_dit_3d_rope_cache(q, cosine, sine)
-            k = apply_video_dit_3d_rope_cache(k, cosine, sine)
+        q = apply_rope(q.transpose(1, 2).reshape(batch, length, self.dim), freqs, self.num_heads)
+        k = apply_rope(k.transpose(1, 2).reshape(batch, length, self.dim), freqs, self.num_heads)
+        q = q.reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
         dropout = self.attention_dropout if self.training else 0.0
         backend = resolve_attention_backend(
             self.attention_backend,
@@ -217,16 +273,13 @@ class DDTEncoderBlock(nn.Module):
     def forward(
         self,
         value: torch.Tensor,
-        positions: torch.Tensor,
+        freqs: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        *,
-        rope_cache: VideoDiTRoPECache | None = None,
     ) -> torch.Tensor:
         value = value + self.attn(
             self.norm1(value),
-            positions,
+            freqs,
             attention_mask,
-            rope_cache=rope_cache,
         )
         return value + self.mlp(self.norm2(value))
 
@@ -263,10 +316,8 @@ class AdaLNZeroDDTBlock(DDTEncoderBlock):
         self,
         value: torch.Tensor,
         condition: torch.Tensor,
-        positions: torch.Tensor,
+        freqs: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        *,
-        rope_cache: VideoDiTRoPECache | None = None,
     ) -> torch.Tensor:
         if condition.ndim == 2:
             condition = condition[:, None]
@@ -279,9 +330,8 @@ class AdaLNZeroDDTBlock(DDTEncoderBlock):
         )
         attended = self.attn(
             modulate(self.norm1(value), shift_a, scale_a),
-            positions,
+            freqs,
             attention_mask,
-            rope_cache=rope_cache,
         )
         value = value + gate_a * attended
         fed_forward = self.mlp(modulate(self.norm2(value), shift_m, scale_m))

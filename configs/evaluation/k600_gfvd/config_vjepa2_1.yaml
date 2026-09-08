@@ -1,9 +1,0 @@
-include: config.yaml
-
-run:
-  name: k600-gfvd-vjepa2-1
-
-checkpoints:
-  stage1: ckpts/vrae/vrae_vjepa2.1.pt
-  dit: ckpts/k600_dit/k600_dit_vjepa2.1.pt
-  latent_normalizer: ckpts/k600_dit/k600_latent_stats_vjepa2.1.pt

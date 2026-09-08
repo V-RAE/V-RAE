@@ -1,0 +1,17 @@
+include:
+  - libero_videodit_reconstruction_multiview.yaml
+
+run_name: vjepa2_1_libero_videodit_reconstruction_multiview_b
+dit:
+  hidden_size: [1024, 2048]
+  depth: [20, 1]
+  encoder_depth: 6
+  num_heads: [16, 16]
+latent_normalizer:
+  path: ckpts/libero_videogen/latent_stats/vjepa2_1_libero_videodit_reconstruction_multiview.pt
+training:
+  resume: null
+  init_from: null
+wandb:
+  group: libero_videogen_reconstruction_multiview_b
+  tags: [libero, reconstruction, multiview, vjepa2_1, dit_b]

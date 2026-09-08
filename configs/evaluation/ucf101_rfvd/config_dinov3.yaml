@@ -1,7 +1,0 @@
-include: config.yaml
-
-run:
-  name: ucf101-rfvd-dinov3
-
-checkpoints:
-  stage1: ckpts/vrae/vrae_dinov3.pt

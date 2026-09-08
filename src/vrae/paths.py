@@ -9,31 +9,15 @@ from typing import Any
 from vrae.config import ConfigError
 
 TRAINING_TASKS = {
+    "libero_videogen",
     "recon_training",
-    "ucf_videogen",
-    "k600_videogen",
-    "cityscapes_video_pred",
-}
-EVAL_TASKS = {
-    "ucf101_rfvd",
-    "ucf101_gfvd",
-    "ucf101_tfvd",
-    "k600_rfvd",
-    "k600_gfvd",
-    "k600_tfvd",
-    "cityscapes_gfid_gfvd",
-    "cityscapes_rfvd",
+    "fastwam",
 }
 
 DEFAULT_DATASET_PATHS = {
-    "ucf101": Path("data/UCF-101"),
-    "k600": Path("data/Kinetics-600"),
-    "cityscapes": Path("data/Cityscapes"),
-    "covla": Path("data/CoVLA-Dataset"),
+    "lerobot": Path("data/lerobot"),
 }
 DEFAULT_THIRD_PARTY_PATHS = {
-    "dinov3": Path("third_party/dinov3"),
-    "eupe": Path("third_party/eupe"),
     "vjepa2_1": Path("third_party/vjepa2"),
 }
 
@@ -168,14 +152,6 @@ class ProjectPaths:
     def writable_checkpoint_root(self) -> Path:
         return self.checkpoint_write_root or self.checkpoint_root
 
-    @property
-    def output_root(self) -> Path:
-        return self.project_root / "outputs"
-
-    @property
-    def eval_checkpoint_root(self) -> Path:
-        return self.checkpoint_root / "eval_models"
-
     def dataset(self, name: str, *, require_exists: bool = True) -> Path:
         path = self.datasets.get(name)
         if path is None:
@@ -245,16 +221,6 @@ class ProjectPaths:
             description="Model checkpoint",
         )
 
-    def eval_checkpoint(self, relative: str | Path, *, require_exists: bool = True) -> Path:
-        raw = Path(relative).expanduser()
-        candidate = raw if raw.is_absolute() else self.project_root / raw
-        return _artifact_path(
-            candidate,
-            self.eval_checkpoint_root,
-            require_exists=require_exists,
-            description="Evaluation model checkpoint",
-        )
-
     def training_run(self, task: str, run_name: str, *, create: bool = False) -> Path:
         if task not in TRAINING_TASKS:
             raise ConfigError(f"Unknown training task: {task}")
@@ -265,20 +231,6 @@ class ProjectPaths:
             checkpoint_root,
             require_exists=False,
             description="Training run",
-        )
-        if create:
-            path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def eval_run(self, task: str, run_name: str, *, create: bool = False) -> Path:
-        if task not in EVAL_TASKS:
-            raise ConfigError(f"Unknown evaluation task: {task}")
-        self._validate_run_name(run_name)
-        path = _artifact_path(
-            self.output_root / task / run_name,
-            self.output_root,
-            require_exists=False,
-            description="Evaluation output",
         )
         if create:
             path.mkdir(parents=True, exist_ok=True)

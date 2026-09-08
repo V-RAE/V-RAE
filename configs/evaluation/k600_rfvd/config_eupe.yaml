@@ -1,7 +1,0 @@
-include: config.yaml
-
-run:
-  name: k600-rfvd-eupe
-
-checkpoints:
-  stage1: ckpts/vrae/vrae_eupe.pt

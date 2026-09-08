@@ -104,7 +104,7 @@ def random_segment_indices(
 
 @dataclass(frozen=True)
 class ClipSampler:
-    """Serializable clip sampling policy shared by datasets and evaluation."""
+    """Serializable clip sampling policy used by the LeRobot dataset."""
 
     clip_length: int
     frame_interval: int = 1
