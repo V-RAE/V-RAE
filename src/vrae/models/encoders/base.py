@@ -166,6 +166,10 @@ def inferred_patch_size(backbone: nn.Module) -> int | None:
 
 class EncoderAdapter(nn.Module, ABC):
     SPEC: EncoderSpec
+    # True only for backbones whose ``_encode_preprocessed`` encodes every frame
+    # independently (image ViTs with tubelet 1). Those can run one observed
+    # frame through ``encode_images`` without padding it to a four-frame clip.
+    PER_FRAME_ENCODING: bool = False
 
     def __init__(
         self,
@@ -288,6 +292,9 @@ class EncoderAdapter(nn.Module, ABC):
             )
 
     def _validate_video(self, video: torch.Tensor) -> torch.Tensor:
+        return self._validate_pixels(video, require_formal_time=True)
+
+    def _validate_pixels(self, video: torch.Tensor, *, require_formal_time: bool) -> torch.Tensor:
         if not torch.is_tensor(video):
             raise TypeError("video must be a torch.Tensor")
         if video.ndim != 5:
@@ -297,7 +304,7 @@ class EncoderAdapter(nn.Module, ABC):
             raise ValueError(f"video dimensions must be positive, got {tuple(video.shape)}")
         if channels != 3:
             raise ValueError(f"Expected three RGB channels, got {channels}")
-        if time % 4:
+        if require_formal_time and time % 4:
             raise ValueError(f"Formal V-RAE input time={time} must be divisible by 4")
         if height % self.patch_size or width % self.patch_size:
             raise ValueError(
@@ -414,3 +421,33 @@ class EncoderAdapter(nn.Module, ABC):
             if self._compiled_forward is not None
             else self._forward_impl(video)
         )
+
+    @property
+    def supports_single_image(self) -> bool:
+        return bool(self.PER_FRAME_ENCODING) and self.encoder_tubelet_size == 1
+
+    @torch.no_grad()
+    def encode_images(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode independent RGB images ``[B,3,H,W]`` to pre-pool features ``[B,C,h,w]``.
+
+        This is the video path with ``T=1``: the same pixel validation and
+        normalization, the same fused multi-layer features, and the same
+        ``[C,h,w]`` grid order as one frame of ``forward``. Only the formal
+        four-frame requirement is skipped, so it is limited to per-frame backbones.
+        """
+
+        if not self.supports_single_image:
+            raise NotImplementedError(
+                f"{self.SPEC.name} (encoder_tubelet_size={self.encoder_tubelet_size}) does not "
+                "encode frames independently and has no single-image feature path"
+            )
+        if not torch.is_tensor(images) or images.ndim != 4:
+            shape = tuple(images.shape) if torch.is_tensor(images) else type(images).__name__
+            raise ValueError(f"Expected RGB images [B,3,H,W], got {shape}")
+        video = self._validate_pixels(images[:, None], require_formal_time=False)
+        batch, time, _, height, width = (int(value) for value in video.shape)
+        grid_size = (height // self.patch_size, width // self.patch_size)
+        self.backbone.eval()
+        output = self._encode_preprocessed(self._preprocess(video), grid_size=grid_size)
+        self._validate_output(output, batch=batch, time=time, grid_size=grid_size)
+        return output[:, 0]

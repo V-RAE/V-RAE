@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from vrae.models.dit.blocks import FramePatchEmbed, as_pair
+
 
 def sample_condition_dropout(
     batch_size: int,
@@ -196,8 +198,118 @@ class ContextLatentConditionAdapter(nn.Module):
         return embedding
 
 
+class FirstFrameConditionAdapter(nn.Module):
+    """Project first-frame patch features to one AdaLN condition per DiT patch.
+
+    ``frame_features`` are frozen pre-pool encoder features ``[B,h*w,C_f]`` in
+    row-major grid order. A non-affine LayerNorm puts them on a fixed scale (the
+    future latents use their own dataset normalizer), a patch convolution with
+    the DiT patch size maps each DiT patch to ``hidden_size``, and a SiLU+Linear
+    completes the projection: ``[B,P,D]`` with ``P`` DiT patches per chunk.
+    Dropped samples receive a learned per-patch null condition instead, so their
+    output carries no first-frame information.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_size: int,
+        *,
+        grid_size: tuple[int, int],
+        patch_size: tuple[int, int] = (1, 1),
+        dropout_prob: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if int(in_channels) <= 0 or int(hidden_size) <= 0:
+            raise ValueError("in_channels and hidden_size must be positive")
+        if not 0 <= float(dropout_prob) <= 1:
+            raise ValueError("dropout_prob must be in [0,1]")
+        self.in_channels = int(in_channels)
+        self.hidden_size = int(hidden_size)
+        self.grid_size = as_pair(grid_size, "grid_size")
+        self.patch_size = as_pair(patch_size, "patch_size")
+        if any(size % patch for size, patch in zip(self.grid_size, self.patch_size, strict=True)):
+            raise ValueError("first-frame grid_size must be divisible by patch_size")
+        self.num_patches = (self.grid_size[0] // self.patch_size[0]) * (
+            self.grid_size[1] // self.patch_size[1]
+        )
+        self.dropout_prob = float(dropout_prob)
+        self.input_norm = nn.LayerNorm(self.in_channels, elementwise_affine=False)
+        self.patch_embed = FramePatchEmbed(self.in_channels, self.hidden_size, self.patch_size)
+        self.projection = nn.Sequential(nn.SiLU(), nn.Linear(self.hidden_size, self.hidden_size))
+        self.null_condition = nn.Parameter(torch.zeros(1, self.num_patches, self.hidden_size))
+        self.reset_parameters()
+
+    @torch.no_grad()
+    def reset_parameters(self) -> None:
+        weight = self.patch_embed.proj.weight
+        # Xavier over [out, in*kh*kw]; copy_ keeps the channels_last layout.
+        flat = torch.empty(weight.shape[0], weight[0].numel(), dtype=weight.dtype)
+        nn.init.xavier_uniform_(flat)
+        weight.copy_(flat.reshape(weight.shape))
+        nn.init.zeros_(self.patch_embed.proj.bias)
+        nn.init.normal_(self.projection[1].weight, std=0.02)
+        nn.init.zeros_(self.projection[1].bias)
+        nn.init.zeros_(self.null_condition)
+
+    def _validate(self, frame_features: torch.Tensor) -> None:
+        tokens = self.grid_size[0] * self.grid_size[1]
+        if frame_features.ndim != 3 or tuple(frame_features.shape[1:]) != (
+            tokens,
+            self.in_channels,
+        ):
+            raise ValueError(
+                f"frame_features must have shape [B,{tokens},{self.in_channels}], "
+                f"got {tuple(frame_features.shape)}"
+            )
+        if not frame_features.is_floating_point():
+            raise TypeError("frame_features must be floating point")
+
+    def project(self, frame_features: torch.Tensor) -> torch.Tensor:
+        """Conditioned projection ``[B,h*w,C_f]`` -> ``[B,P,D]`` without dropout."""
+
+        self._validate(frame_features)
+        batch = frame_features.shape[0]
+        parameter = self.patch_embed.proj.weight
+        normalized = self.input_norm(frame_features.float()).to(dtype=parameter.dtype)
+        grid = normalized.reshape(batch, *self.grid_size, self.in_channels).permute(0, 3, 1, 2)
+        return self.projection(self.patch_embed(grid))
+
+    def prepare(
+        self,
+        frame_features: torch.Tensor,
+        *,
+        drop_mask: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate(frame_features)
+        mask = _resolve_drop_mask(
+            batch_size=frame_features.shape[0],
+            device=frame_features.device,
+            probability=self.dropout_prob,
+            training=self.training,
+            drop_mask=drop_mask,
+            generator=generator,
+        )
+        projected = self.project(frame_features)
+        null = self.null_condition.to(dtype=projected.dtype).expand_as(projected)
+        condition = torch.where(mask[:, None, None], null, projected)
+        return condition, mask
+
+    def forward(
+        self,
+        frame_features: torch.Tensor,
+        *,
+        drop_mask: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        condition, _ = self.prepare(frame_features, drop_mask=drop_mask, generator=generator)
+        return condition
+
+
 __all__ = [
     "ContextLatentConditionAdapter",
+    "FirstFrameConditionAdapter",
     "LabelConditionAdapter",
     "sample_condition_dropout",
 ]

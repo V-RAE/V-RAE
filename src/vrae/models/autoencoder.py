@@ -133,6 +133,27 @@ class VRAE(nn.Module):
         features = self.encode_frames(video)
         return self.temporal_pool(features)
 
+    @property
+    def supports_single_image(self) -> bool:
+        return bool(getattr(self.encoder, "supports_single_image", False))
+
+    @torch.no_grad()
+    def encode_image_features(self, images: torch.Tensor) -> torch.Tensor:
+        """Pre-pool fused encoder features ``[B,C,h,w]`` of independent RGB images.
+
+        The temporal pool is not applied, and video inputs keep the
+        divisible-by-four rule of ``encode_frames``.
+        """
+
+        encode_images = getattr(self.encoder, "encode_images", None)
+        if not self.supports_single_image or not callable(encode_images):
+            name = self.encoder.metadata().get("name", type(self.encoder).__name__)
+            raise NotImplementedError(
+                f"V-RAE encoder {name!r} has no single-image feature path; first-frame "
+                "conditioning needs a per-frame image backbone (EUPE, DINOv3, or SigLIP2)"
+            )
+        return encode_images(images)
+
     def decode(self, clean_latents: torch.Tensor) -> torch.Tensor:
         return self.decoder(clean_latents)
 

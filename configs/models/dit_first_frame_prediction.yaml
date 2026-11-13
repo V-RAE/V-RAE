@@ -1,0 +1,14 @@
+# Future-only DDT with first-frame spatial AdaLN (vrae.models.dit.first_frame_prediction_dit).
+# grid_size, in_channels/frame_channels and future_chunks are derived from the V-RAE
+# encoder, data.image_size and the 16 future frames when the trainer builds the model.
+dit:
+  name: vrae_first_frame_prediction_dit
+  hidden_size: [1152, 2048]
+  depth: [28, 2]
+  encoder_depth: 8
+  num_heads: [16, 16]
+  mlp_ratio: 4.0
+  time_embed_dim: 256
+  frame_dropout: 0.1
+  rope_theta: 10000.0
+  gradient_checkpointing: true

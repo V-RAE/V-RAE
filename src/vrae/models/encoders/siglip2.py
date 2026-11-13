@@ -169,6 +169,7 @@ def load_local_siglip2(model_dir: Path) -> nn.Module:
 @ENCODERS.decorator("siglip2")
 class SigLIP2Adapter(EncoderAdapter):
     SPEC = SIGLIP2_SPEC
+    PER_FRAME_ENCODING = True
 
     def __init__(
         self,

@@ -364,6 +364,33 @@ class VRAEVideoDiT(nn.Module):
             generator=condition_generator,
         )
         encoder_condition = time_embedding + label_embedding.to(time_embedding.dtype)
+        return self._denoise(
+            grid,
+            batch=batch,
+            encoder_condition=encoder_condition,
+            fusion_condition=time_embedding,
+            return_base=return_base,
+            return_intermediate=return_intermediate,
+        )
+
+    def _denoise(
+        self,
+        grid: torch.Tensor,
+        *,
+        batch: int,
+        encoder_condition: torch.Tensor,
+        fusion_condition: torch.Tensor,
+        return_base: bool,
+        return_intermediate: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[Any, torch.Tensor]:
+        """Shared DDT body: AdaLN encoder, fused decoder condition, full and base heads.
+
+        ``encoder_condition`` modulates every encoder block. ``fusion_condition``
+        is added to the final and base encoder states before the decoder/full head
+        and base head conditions. Both are ``[B,1,D]`` (broadcast) or per-token
+        ``[B,num_chunks*P,D]`` in chunk-major order.
+        """
+
         sequence = embed_video_frames(
             self.encoder_embed,
             grid,
@@ -390,7 +417,7 @@ class VRAEVideoDiT(nn.Module):
         if base_sequence is None:
             raise RuntimeError("base encoder activation was not captured")
 
-        decoder_condition = self.encoder_to_decoder(F.silu(time_embedding + sequence))
+        decoder_condition = self.encoder_to_decoder(F.silu(fusion_condition + sequence))
         decoder_sequence = embed_video_frames(
             self.decoder_embed,
             grid,
@@ -415,7 +442,7 @@ class VRAEVideoDiT(nn.Module):
             self.final_layer(decoder_sequence, decoder_condition),
             batch_size=batch,
         )
-        base_condition = F.silu(time_embedding + base_sequence)
+        base_condition = F.silu(fusion_condition + base_sequence)
         base = self._unpatchify(
             self.base_final_layer(base_condition, base_condition),
             batch_size=batch,

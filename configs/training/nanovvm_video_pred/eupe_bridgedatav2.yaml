@@ -1,0 +1,22 @@
+# Single-source form of the same task: one root/manifest/manifest_meta per split, relative to
+# the NanoVVM data root (datasets.nanovvm in the --paths file).
+include: _eupe_common.yaml
+run_name: eupe_bridgedatav2_cond1gen16
+latent_normalizer:
+  path: ckpts/nanovvm_video_pred/latent_stats/eupe_bridgedatav2_cond1gen16_future_vrae_ema_bf16.pt
+  fit_clips: 20000
+  fit_seed: 0
+  batch_size: 16
+data:
+  train:
+    name: bridgedatav2
+    dataset: bridgedatav2
+    root: bridgedatav2_video/data/raw
+    manifest: bridgedatav2_video/manifests/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+    manifest_meta: bridgedatav2_video/manifests/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+  val:
+    name: bridgedatav2
+    dataset: bridgedatav2
+    root: bridgedatav2_video/data/raw
+    manifest: bridgedatav2_video/manifests/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+    manifest_meta: bridgedatav2_video/manifests/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml

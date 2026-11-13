@@ -46,6 +46,31 @@ class VRAELatentAdapter(nn.Module):
             latents = self._autoencoder.encode(video)
         return latents.float()
 
+    @property
+    def supports_single_image(self) -> bool:
+        return bool(getattr(self._autoencoder, "supports_single_image", False))
+
+    @torch.no_grad()
+    def encode_image_grid(self, images: torch.Tensor) -> torch.Tensor:
+        """Frozen pre-pool features ``[B,C,h,w]`` of RGB images ``[B,3,H,W]``."""
+
+        encode = getattr(self._autoencoder, "encode_image_features", None)
+        if not callable(encode):
+            raise NotImplementedError(
+                f"{type(self._autoencoder).__name__} has no single-image feature path"
+            )
+        with self._autocast(images):
+            features = encode(images)
+        return features.float()
+
+    @staticmethod
+    def image_grid_to_tokens(features: torch.Tensor) -> torch.Tensor:
+        """``[B,C,h,w]`` -> ``[B,h*w,C]`` in the row-major order of ``grid_to_tokens``."""
+
+        if features.ndim != 4:
+            raise ValueError(f"Expected [B,C,H,W], got {tuple(features.shape)}")
+        return features.permute(0, 2, 3, 1).flatten(1, 2).contiguous()
+
     @torch.no_grad()
     def decode_grid(self, latents: torch.Tensor) -> torch.Tensor:
         with self._autocast(latents):

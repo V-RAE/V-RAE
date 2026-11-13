@@ -65,6 +65,7 @@ def load_local_eupe(*, source_dir: Path, checkpoint_path: Path) -> nn.Module:
 @ENCODERS.decorator("eupe")
 class EUPEAdapter(EncoderAdapter):
     SPEC = EUPE_SPEC
+    PER_FRAME_ENCODING = True
 
     def __init__(
         self,

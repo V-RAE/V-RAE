@@ -4,6 +4,7 @@ datasets:
   k600: path/to/Kinetics600/videos
   cityscapes: path/to/Cityscapes
   covla: path/to/CoVLA-Dataset
+  nanovvm: path/to/NANOVVM_DATA  # root holding bridgedatav2_video/, droid_video/, ...
 third_party:
   dinov3: path/to/V-RAE/third_party/dinov3
   eupe: path/to/V-RAE/third_party/eupe

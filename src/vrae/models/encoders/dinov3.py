@@ -112,6 +112,7 @@ def load_local_dinov3(*, source_dir: Path, checkpoint_path: Path) -> nn.Module:
 @ENCODERS.decorator("dinov3")
 class DINOv3Adapter(EncoderAdapter):
     SPEC = DINOV3_SPEC
+    PER_FRAME_ENCODING = True
 
     def __init__(
         self,

@@ -1,0 +1,202 @@
+# EUPE-B/16 V-RAE, first-frame conditioned 16-frame future prediction on NanoVVM mix5.
+# Sources are the 18 cond1gen16_interval3 manifests of nanovvm@37c2377
+# configs/scaling-ladder/tiny/mix5_tiny_vpred_interval3_l1_cond1gen16_bs64_lr2e-4_wd0_ep1.yaml:
+#   data.train = training.video.sources   (split_val0.0001_min100/train)
+#   data.val   = fvd.splits.val.sources   (split_val0.0001_min100/val, never trained on)
+# NanoVVM's ${paths.data}/ prefix is dropped: every root/manifest/manifest_meta below is
+# relative to the NanoVVM data root, i.e. datasets.nanovvm in the --paths file (or
+# data.data_root in _eupe_common.yaml). ${paths.holdout} is written out as
+# split_val0.0001_min100. Check the resolved files with:
+#   python -m vrae.training.nanovvm_video_pred.check --config <this file> --paths <paths file>
+include: _eupe_common.yaml
+run_name: eupe_mix5_cond1gen16
+latent_normalizer:
+  path: ckpts/nanovvm_video_pred/latent_stats/eupe_mix5_cond1gen16_future_vrae_ema_bf16.pt
+  fit_clips: 20000
+  fit_seed: 0
+  batch_size: 16
+data:
+  train:
+    sources:
+      - name: bridgedatav2
+        dataset: bridgedatav2
+        root: bridgedatav2_video/data/raw
+        manifest: bridgedatav2_video/manifests/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: bridgedatav2_video/manifests/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: droid/exterior_image_1_left
+        dataset: droid
+        root: droid_video/data/exterior_image_1_left
+        manifest: droid_video/manifests/exterior_image_1_left/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: droid_video/manifests/exterior_image_1_left/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: droid/exterior_image_2_left
+        dataset: droid
+        root: droid_video/data/exterior_image_2_left
+        manifest: droid_video/manifests/exterior_image_2_left/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: droid_video/manifests/exterior_image_2_left/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: droid/wrist_image_left
+        dataset: droid
+        root: droid_video/data/wrist_image_left
+        manifest: droid_video/manifests/wrist_image_left/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: droid_video/manifests/wrist_image_left/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: fineart/cam_high
+        dataset: fineart
+        root: fineart_video/data/cam_high
+        manifest: fineart_video/manifests/cam_high/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: fineart_video/manifests/cam_high/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: fineart/cam_left_wrist
+        dataset: fineart
+        root: fineart_video/data/cam_left_wrist
+        manifest: fineart_video/manifests/cam_left_wrist/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: fineart_video/manifests/cam_left_wrist/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: fineart/cam_low
+        dataset: fineart
+        root: fineart_video/data/cam_low
+        manifest: fineart_video/manifests/cam_low/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: fineart_video/manifests/cam_low/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: fineart/cam_right_wrist
+        dataset: fineart
+        root: fineart_video/data/cam_right_wrist
+        manifest: fineart_video/manifests/cam_right_wrist/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: fineart_video/manifests/cam_right_wrist/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: egopro/head_left
+        dataset: egopro
+        root: egopro448_video/data/head_left
+        manifest: egopro448_video/manifests/head_left/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: egopro448_video/manifests/head_left/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: egopro/head_right
+        dataset: egopro
+        root: egopro448_video/data/head_right
+        manifest: egopro448_video/manifests/head_right/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: egopro448_video/manifests/head_right/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: egopro/left_wrist
+        dataset: egopro
+        root: egopro448_video/data/left_wrist
+        manifest: egopro448_video/manifests/left_wrist/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: egopro448_video/manifests/left_wrist/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: egopro/right_wrist
+        dataset: egopro
+        root: egopro448_video/data/right_wrist
+        manifest: egopro448_video/manifests/right_wrist/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: egopro448_video/manifests/right_wrist/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: egoexo4d/ego/train
+        dataset: egoexo4d
+        root: egoexo4d_video/data/ego/train
+        manifest: egoexo4d_video/manifests/ego/train/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: egoexo4d_video/manifests/ego/train/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: egoexo4d/ego/val
+        dataset: egoexo4d
+        root: egoexo4d_video/data/ego/val
+        manifest: egoexo4d_video/manifests/ego/val/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: egoexo4d_video/manifests/ego/val/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: egoexo4d/ego/test
+        dataset: egoexo4d
+        root: egoexo4d_video/data/ego/test
+        manifest: egoexo4d_video/manifests/ego/test/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: egoexo4d_video/manifests/ego/test/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: egoexo4d/exo/train
+        dataset: egoexo4d
+        root: egoexo4d_video/data/exo/train
+        manifest: egoexo4d_video/manifests/exo/train/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: egoexo4d_video/manifests/exo/train/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: egoexo4d/exo/val
+        dataset: egoexo4d
+        root: egoexo4d_video/data/exo/val
+        manifest: egoexo4d_video/manifests/exo/val/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: egoexo4d_video/manifests/exo/val/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+      - name: egoexo4d/exo/test
+        dataset: egoexo4d
+        root: egoexo4d_video/data/exo/test
+        manifest: egoexo4d_video/manifests/exo/test/cond1gen16_interval3/split_val0.0001_min100/train/manifest.json
+        manifest_meta: egoexo4d_video/manifests/exo/test/cond1gen16_interval3/split_val0.0001_min100/train/meta.yaml
+  val:
+    sources:
+      - name: bridgedatav2
+        dataset: bridgedatav2
+        root: bridgedatav2_video/data/raw
+        manifest: bridgedatav2_video/manifests/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: bridgedatav2_video/manifests/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: droid/exterior_image_1_left
+        dataset: droid
+        root: droid_video/data/exterior_image_1_left
+        manifest: droid_video/manifests/exterior_image_1_left/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: droid_video/manifests/exterior_image_1_left/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: droid/exterior_image_2_left
+        dataset: droid
+        root: droid_video/data/exterior_image_2_left
+        manifest: droid_video/manifests/exterior_image_2_left/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: droid_video/manifests/exterior_image_2_left/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: droid/wrist_image_left
+        dataset: droid
+        root: droid_video/data/wrist_image_left
+        manifest: droid_video/manifests/wrist_image_left/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: droid_video/manifests/wrist_image_left/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: fineart/cam_high
+        dataset: fineart
+        root: fineart_video/data/cam_high
+        manifest: fineart_video/manifests/cam_high/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: fineart_video/manifests/cam_high/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: fineart/cam_left_wrist
+        dataset: fineart
+        root: fineart_video/data/cam_left_wrist
+        manifest: fineart_video/manifests/cam_left_wrist/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: fineart_video/manifests/cam_left_wrist/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: fineart/cam_low
+        dataset: fineart
+        root: fineart_video/data/cam_low
+        manifest: fineart_video/manifests/cam_low/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: fineart_video/manifests/cam_low/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: fineart/cam_right_wrist
+        dataset: fineart
+        root: fineart_video/data/cam_right_wrist
+        manifest: fineart_video/manifests/cam_right_wrist/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: fineart_video/manifests/cam_right_wrist/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: egopro/head_left
+        dataset: egopro
+        root: egopro448_video/data/head_left
+        manifest: egopro448_video/manifests/head_left/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: egopro448_video/manifests/head_left/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: egopro/head_right
+        dataset: egopro
+        root: egopro448_video/data/head_right
+        manifest: egopro448_video/manifests/head_right/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: egopro448_video/manifests/head_right/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: egopro/left_wrist
+        dataset: egopro
+        root: egopro448_video/data/left_wrist
+        manifest: egopro448_video/manifests/left_wrist/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: egopro448_video/manifests/left_wrist/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: egopro/right_wrist
+        dataset: egopro
+        root: egopro448_video/data/right_wrist
+        manifest: egopro448_video/manifests/right_wrist/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: egopro448_video/manifests/right_wrist/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: egoexo4d/ego/train
+        dataset: egoexo4d
+        root: egoexo4d_video/data/ego/train
+        manifest: egoexo4d_video/manifests/ego/train/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: egoexo4d_video/manifests/ego/train/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: egoexo4d/ego/val
+        dataset: egoexo4d
+        root: egoexo4d_video/data/ego/val
+        manifest: egoexo4d_video/manifests/ego/val/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: egoexo4d_video/manifests/ego/val/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: egoexo4d/ego/test
+        dataset: egoexo4d
+        root: egoexo4d_video/data/ego/test
+        manifest: egoexo4d_video/manifests/ego/test/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: egoexo4d_video/manifests/ego/test/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: egoexo4d/exo/train
+        dataset: egoexo4d
+        root: egoexo4d_video/data/exo/train
+        manifest: egoexo4d_video/manifests/exo/train/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: egoexo4d_video/manifests/exo/train/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: egoexo4d/exo/val
+        dataset: egoexo4d
+        root: egoexo4d_video/data/exo/val
+        manifest: egoexo4d_video/manifests/exo/val/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: egoexo4d_video/manifests/exo/val/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml
+      - name: egoexo4d/exo/test
+        dataset: egoexo4d
+        root: egoexo4d_video/data/exo/test
+        manifest: egoexo4d_video/manifests/exo/test/cond1gen16_interval3/split_val0.0001_min100/val/manifest.json
+        manifest_meta: egoexo4d_video/manifests/exo/test/cond1gen16_interval3/split_val0.0001_min100/val/meta.yaml

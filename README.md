@@ -209,6 +209,7 @@ referenced by the selected configuration.
 | Class-conditional generation training | UCF101 | `scripts/train/ucf101.sh` |
 | Class-conditional generation training | Kinetics-600 | `scripts/train/k600.sh` |
 | Future-frame generation training | Cityscapes | `vrae.training.cityscapes_video_pred.train` |
+| First-frame to 16-frame prediction | NanoVVM clip manifests (e.g. mix5) | `vrae.training.nanovvm_video_pred.train` |
 
 ### 3.1 Reconstruction Training
 
@@ -334,6 +335,87 @@ torchrun --standalone --nproc_per_node=8 \
   --config configs/training/cityscapes_video_pred/cityscapes.yaml \
   --paths configs/paths.local.yaml
 ```
+
+### 3.6 NanoVVM First-Frame Future Prediction
+
+This task generates the next 16 RGB frames from one observed RGB frame. It reads
+NanoVVM's raw videos and clip manifests directly (no rebuild, no CSV conversion, no
+NanoVVM install); manifests are validated with NanoVVM's rules (schema, sampling
+parameters, frame ranges, clip count, SHA-256).
+
+For a manifest record with `start_frame = s`, the clip is `[s, s+49)` and exactly the
+source frames `s + 3k`, `k = 0..16`, are decoded with decord. All 17 frames get the same
+short-side resize to 256 (bilinear, no antialias) and 256x256 center crop, with no flip:
+
+```text
+condition_rgb = clip[:, 0]       # [B,3,256,256]     source frame s, the only observed frame
+future_rgb    = clip[:, 1:17]    # [B,16,3,256,256]  source frames s+3 ... s+48
+frame_features = encode_image_grid(condition_rgb) -> [B,256,768]  pre-pool EUPE K7 patch features
+z_future       = grid_to_tokens(encode_grid(future_rgb)) -> [B,4,256,768]  (normalized for the DiT)
+```
+
+The DiT (`vrae_first_frame_prediction_dit`) attends over the four future chunks only. A
+trainable projection inside the DiT maps each first-frame patch to the DiT width and adds
+it to the time embedding; the result is repeated over the four chunks as the per-token
+AdaLN condition (`[B,4*P,D]`), so each future patch is modulated by the first-frame patch
+at the same position. Condition dropout uses a learned null condition, which CFG reuses.
+
+Add the NanoVVM data root to the path file. Source paths in the configs are relative to
+it (NanoVVM's `${paths.data}/` prefix is dropped, because V-RAE configs are plain YAML):
+
+```yaml
+datasets:
+  nanovvm: /path/to/NANOVVM_DATA   # holds bridgedatav2_video/, droid_video/, fineart_video/, ...
+```
+
+`configs/training/nanovvm_video_pred/eupe_mix5.yaml` lists the 18 train sources and 18
+val sources of NanoVVM's `mix5_tiny_..._cond1gen16_bs64` config;
+`eupe_bridgedatav2.yaml` shows the single-source `root`/`manifest`/`manifest_meta` form.
+
+Check the config, the derived shapes, and every resolved file:
+
+```bash
+PYTHONPATH=src python -m vrae.training.nanovvm_video_pred.train \
+  --config configs/training/nanovvm_video_pred/eupe_mix5.yaml --build-only
+PYTHONPATH=src python -m vrae.training.nanovvm_video_pred.check \
+  --config configs/training/nanovvm_video_pred/eupe_mix5.yaml \
+  --paths configs/paths.local.yaml            # add --load-manifests --decode 18 for a full check
+```
+
+Fit the train-future latent statistics (`latent_normalizer.fit_clips` seeded clips, future
+latents only). Training computes the file when it is missing and refuses a file whose
+stage-1, train manifests, image size, or frame protocol differ from the config:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  -m vrae.training.nanovvm_video_pred.latent_stats \
+  --config configs/training/nanovvm_video_pred/eupe_mix5.yaml \
+  --paths configs/paths.local.yaml
+```
+
+Run one training step, then train:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+  -m vrae.training.nanovvm_video_pred.train \
+  --config configs/training/nanovvm_video_pred/eupe_mix5.yaml \
+  --paths configs/paths.local.yaml --max-steps 1
+```
+
+Sample 16 frames from one first frame and a seed (an image, or frame `S` of a video), or
+from the val manifests (which also stores the RGB target `clip[:, 1:17]`):
+
+```bash
+PYTHONPATH=src python -m vrae.training.nanovvm_video_pred.sample \
+  --config configs/training/nanovvm_video_pred/eupe_mix5.yaml --paths configs/paths.local.yaml \
+  --checkpoint ckpts/nanovvm_video_pred/eupe_mix5_cond1gen16/checkpoints/latest.pt \
+  --output outputs/nanovvm_samples --first-frame frame.png --seed 0
+# or: --video path/to/video.mp4 --start-frame 49 --seed 0
+# or: --split val --count 64
+```
+
+Each output holds `predicted_future` `[16,3,256,256]`; `display17` (the first frame
+followed by the prediction) is for viewing only.
 
 ## 4. Evaluation
 
